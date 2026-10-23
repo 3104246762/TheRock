@@ -572,3 +572,13 @@ features should be turned off:
 -DTHEROCK_ENABLE_MATH_LIBS=OFF \
 -DTHEROCK_ENABLE_ML_LIBS=OFF \
 ```
+
+### Building on Windows through GitHub Actions
+
+To build a single-GPU-family ROCm distribution on Windows through GitHub
+Actions (for example on your own machine as a self-hosted runner), see
+[github_actions_windows_build.md](./github_actions_windows_build.md). The
+`build_windows_single_family.yml` workflow follows the same source-build steps
+documented above and additionally verifies and packages the result. Be aware
+that GitHub-hosted runners do not have enough disk space for a full source
+build (~150-200 GB needed vs ~14 GB available).

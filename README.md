@@ -105,6 +105,12 @@ python3 ./build_tools/fetch_sources.py
 > the section for
 > [installing tools](./docs/development/windows_support.md#install-tools).
 
+> [!TIP]
+> To build ROCm for a single GPU family through GitHub Actions (e.g. on your
+> own Windows machine as a self-hosted runner) instead of locally, see
+> [github_actions_windows_build.md](./docs/development/github_actions_windows_build.md).
+> Note that GitHub-hosted runners lack the disk space for a full source build.
+
 If the build system is a non-English system. Make sure to switch to `utf-8`.
 
 ```cmd

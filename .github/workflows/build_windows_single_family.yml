@@ -1,0 +1,907 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+
+# Build ROCm on Windows for a single AMD GPU family
+# =============================================================================
+#
+# WHAT THIS WORKFLOW DOES
+# -----------------------
+# Runs a full TheRock source build of ROCm for ONE AMD GPU family on Windows
+# (default: gfx900, i.e. Vega 10 / Radeon RX Vega), following the documented
+# source-build path from README.md and docs/development/windows_support.md:
+#
+#   python ./build_tools/fetch_sources.py
+#   cmake -B build -GNinja --preset=windows-release -DTHEROCK_AMDGPU_FAMILIES=<family>
+#   cmake --build build --target therock-artifacts therock-dist
+#
+# Afterwards it verifies the produced dist tree, packages it as
+# `therock-dist-windows-<family>-<version>.tar.gz` (same naming convention as
+# the published multi-arch tarballs, see RELEASES.md), and - only on a runner
+# that actually has an AMD GPU - verifies GPU runtime behavior with the built
+# `hipInfo.exe` and a small HIP kernel.
+#
+# WHY A SELF-HOSTED RUNNER BY DEFAULT
+# -----------------------------------
+# A full ROCm source build needs roughly 150-200 GB of disk space (see the
+# warning in README.md). GitHub-hosted Windows runners provide only ~14 GB of
+# SSD, so they cannot host this build. The upstream
+# `multi_arch_build_windows*.yml` workflows therefore run on AMD's own large
+# self-hosted runners and pass artifacts through internal S3 buckets; neither
+# is available to a fork. This workflow avoids both dependencies: everything is
+# built from source in a single CMake configuration and nothing is uploaded
+# anywhere except an (optional) GitHub Actions artifact.
+#
+# If you have access to GitHub larger runners with enough disk, point the
+# `runner_labels` input at them; the build jobs stay identical.
+#
+# BUILD vs. GPU RUNTIME VERIFICATION
+# ----------------------------------
+# * The `build` job is COMPILE-ONLY. It succeeds if ROCm compiles and the
+#   expected dist files exist. It does NOT prove the result runs on any GPU.
+# * The `gpu-validate` job runs only when the runner has an AMD GPU, and runs
+#   `hipInfo.exe` plus a HIP vector-add kernel from the built dist. Only a
+#   green `gpu-validate` means "verified to run on this machine's GPU".
+# * Note that gfx900 on Windows is "Build Passing" but NOT "Sanity Tested" /
+#   "Release Ready" per SUPPORTED_GPUS.md: the build target exists, but AMD
+#   has not qualified it. See docs/development/github_actions_windows_build.md.
+#
+# TRIGGERING
+# ----------
+# Manual only (workflow_dispatch): a full build takes hours, so running it on
+# every push would be wasteful. Start it from the Actions tab ->
+# "Build ROCm (Windows, single GPU family)" -> "Run workflow". The repo's own
+# push/PR checks (pre-commit.yml, unit_tests.yml, ...) are unaffected.
+#
+# No secrets are required. The default GITHUB_TOKEN is only used for checkout
+# and for authenticated git fetches (to avoid API rate limits).
+
+name: Build ROCm (Windows, single GPU family)
+
+on:
+  workflow_dispatch:
+    inputs:
+      amdgpu_family:
+        description: "AMDGPU family or target to build (must exist in cmake/therock_amdgpu_targets.cmake). Default gfx900 = Vega 10 / Radeon RX Vega."
+        type: string
+        default: gfx900
+      runner_labels:
+        description: "JSON array of runner labels. Default: a self-hosted Windows x64 runner labeled rocm-build. GitHub-hosted runners lack the disk space for a full build."
+        type: string
+        default: '["self-hosted", "Windows", "X64", "rocm-build"]'
+      build_dir:
+        description: "Build directory. Needs roughly 150-200 GB free for a full ROCm source build (README.md). Sources and the Python venv live in the runner workspace (~25 GB)."
+        type: string
+        default: D:/therock-build
+      ref:
+        description: "Branch, tag or SHA to build. Empty = the ref you trigger the workflow from."
+        type: string
+        default: ""
+      release_type:
+        description: "Version stamping: dev | nightly | ci | prerelease | release (see build_tools/compute_rocm_package_version.py)."
+        type: string
+        default: dev
+      enable_media_libs:
+        description: "Build media libraries (amd-mesa VA-API + rocDecode). Adds significant build time and disk usage and needs winflexbison3. Off by default."
+        type: boolean
+        default: false
+      enable_ml_libs:
+        description: "Build ML libraries (MIOpen, hipDNN, ...). Largest single component; turn off to cut build time and disk usage substantially."
+        type: boolean
+        default: true
+      use_ccache:
+        description: "Use ccache as compiler cache (recommended, speeds up re-runs). Disable if you hit 'lld-link: error: duplicate symbol' failures."
+        type: boolean
+        default: true
+      run_gpu_validation:
+        description: "After a successful build, verify GPU runtime on runners that have an AMD GPU (hipInfo + HIP kernel). This is the ONLY real GPU verification in this workflow."
+        type: boolean
+        default: true
+      upload_artifacts:
+        description: "Upload the dist tarball as a workflow artifact. GitHub Free only includes 500 MB artifact storage, so this fails for multi-GB tarballs; prefer the local build_dir path on a self-hosted runner."
+        type: boolean
+        default: false
+
+run-name: "Build ROCm Windows ${{ inputs.amdgpu_family }} @ ${{ github.ref_name }}"
+
+permissions:
+  contents: read
+
+# A single self-hosted runner can only build one configuration at a time.
+# Queue runs instead of cancelling a build that is already hours in.
+concurrency:
+  group: build-windows-single-family-${{ inputs.amdgpu_family }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # --------------------------------------------------------------------------
+  # Validate the requested GPU family against the repository's target list
+  # (cmake/therock_amdgpu_targets.cmake). Runs on a cheap hosted runner so a
+  # typo fails in seconds instead of after hours of building.
+  # --------------------------------------------------------------------------
+  validate-config:
+    name: Validate build target
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    outputs:
+      valid: ${{ steps.validate.outputs.valid }}
+      resolved_targets: ${{ steps.validate.outputs.resolved_targets }}
+      offload_arch: ${{ steps.validate.outputs.offload_arch }}
+      excluded_projects: ${{ steps.validate.outputs.excluded_projects }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref }}
+
+      - name: Validate AMDGPU family selection
+        id: validate
+        env:
+          SELECTION: ${{ inputs.amdgpu_family }}
+        run: |
+          python ./build_tools/github_actions/validate_amdgpu_selection.py "${SELECTION}"
+
+      - name: Validate runner labels are a JSON array of strings
+        env:
+          RUNNER_LABELS: ${{ inputs.runner_labels }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+
+          labels = json.loads(os.environ["RUNNER_LABELS"])
+          assert isinstance(labels, list) and labels, labels
+          assert all(isinstance(label, str) for label in labels), labels
+          print("runner labels:", labels)
+          PY
+
+  # --------------------------------------------------------------------------
+  # Preflight: environment sanity on the (self-hosted) build machine.
+  # Fails fast on insufficient disk/RAM, warns about known conflicts, and
+  # installs missing toolchain components (MSVC Build Tools, CMake, Ninja,
+  # Strawberry Perl for gfortran/patch, ...).
+  # --------------------------------------------------------------------------
+  preflight:
+    name: Preflight checks
+    needs: validate-config
+    if: ${{ needs.validate-config.outputs.valid == 'true' }}
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 90
+    outputs:
+      gpu_present: ${{ steps.gpu.outputs.gpu_present }}
+      gpu_name: ${{ steps.gpu.outputs.gpu_name }}
+      gpu_driver: ${{ steps.gpu.outputs.gpu_driver }}
+    env:
+      BUILD_DIR: ${{ inputs.build_dir }}
+    steps:
+      - name: Check OS, CPU and RAM
+        shell: powershell
+        run: |
+          $os = Get-CimInstance Win32_OperatingSystem
+          $cs = Get-CimInstance Win32_ComputerSystem
+          $ramGb = [math]::Round($cs.TotalPhysicalMemory/1GB, 1)
+          Write-Output "OS   : $($os.Caption) ($($os.Version), $($os.OSArchitecture))"
+          Write-Output "CPU  : $($cs.Name) / $($cs.NumberOfLogicalProcessors) logical processors"
+          Write-Output "RAM  : $ramGb GB"
+          if ($os.OSArchitecture -ne "64-bit") { throw "A 64-bit Windows installation is required." }
+          if ($ramGb -lt 16) { Write-Warning "Less than 16 GB RAM detected. 16 GB+ is recommended; full builds may fail or thrash." }
+
+      - name: Check disk space
+        shell: powershell
+        env:
+          BUILD_DIR: ${{ inputs.build_dir }}
+        run: |
+          function Test-FreeSpace([string]$path, [int]$minGb, [string]$what) {
+            $root = [System.IO.Path]::GetPathRoot($path)
+            if (-not $root) { throw "Could not determine the drive for path '$path'." }
+            $letter = $root.Substring(0, 1)
+            $drive = Get-PSDrive -Name $letter
+            $freeGb = [math]::Round($drive.Free/1GB, 1)
+            Write-Output "$what : $path -> drive $letter with $freeGb GB free"
+            if ($freeGb -lt $minGb) {
+              throw ("$what needs at least $minGb GB free, but only $freeGb GB are available on $letter. " +
+                     "Free up space, or point the build_dir input (and the runner work directory) at a larger drive.")
+            }
+            return $freeGb
+          }
+          # Full ROCm source build: ~150-200 GB (see README.md warning).
+          $buildFree = Test-FreeSpace $env:BUILD_DIR 100 "Build directory"
+          if ($buildFree -lt 200) {
+            Write-Warning ("Build drive has less than 200 GB free. A full build can need up to ~200 GB; " +
+                           "if it runs out of space, re-run with enable_ml_libs/enable_media_libs turned off.")
+          }
+          # The runner workspace holds the checkout, submodule sources and the Python venv (~25 GB).
+          Test-FreeSpace $env:GITHUB_WORKSPACE 25 "Runner workspace"
+
+      - name: Detect AMD GPU and driver
+        id: gpu
+        shell: powershell
+        run: |
+          $gpus = @(Get-CimInstance Win32_VideoController | Where-Object { $_.Name -match 'AMD|Radeon|ATI' })
+          if ($gpus.Count -eq 0) {
+            Write-Warning "No AMD/Radeon display adapter found. GPU runtime verification will be skipped; the build still runs."
+            "gpu_present=false" >> $env:GITHUB_OUTPUT
+            "gpu_name=" >> $env:GITHUB_OUTPUT
+            "gpu_driver=" >> $env:GITHUB_OUTPUT
+          } else {
+            foreach ($g in $gpus) { Write-Output "GPU   : $($g.Name) (driver $($g.DriverVersion))" }
+            "gpu_present=true" >> $env:GITHUB_OUTPUT
+            "gpu_name=$($gpus[0].Name)" >> $env:GITHUB_OUTPUT
+            "gpu_driver=$($gpus[0].DriverVersion)" >> $env:GITHUB_OUTPUT
+          }
+          # NOTE: a display adapter being present does not prove HIP compute works.
+          # Only the gpu-validate job (hipInfo + kernel) can verify that.
+
+      - name: Warn about pre-existing ROCm / HIP SDK installs
+        shell: powershell
+        run: |
+          $amdRoot = "C:\Program Files\AMD"
+          $found = Get-ChildItem $amdRoot -ErrorAction SilentlyContinue
+          if ($found) {
+            Write-Warning ("Found existing AMD installs: " + ($found.Name -join ', ') + ". " +
+              "Pre-existing HIP SDK / ROCm installs are known to break TheRock builds (ROCm/TheRock#651). " +
+              "If the build fails with HIP-related errors, uninstall them and re-run.")
+          }
+
+      - name: Configure git (long paths, symlinks)
+        shell: powershell
+        run: |
+          # Run before the tool check/installation so long paths apply to the
+          # actions/checkout of the build job (same machine, same user).
+          # --system needs admin rights; fall back to --global when unavailable.
+          # Note: native command failures do not throw in PowerShell, so check
+          # $LASTEXITCODE explicitly.
+          git config --system core.longpaths true 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Output "Could not set system git config (needs admin); using --global instead."
+            git config --global core.longpaths true
+          }
+          git config --global core.symlinks true
+          git config --global fetch.parallel 10
+          Write-Output "core.longpaths = $(git config --global --get core.longpaths)"
+          Write-Output "core.symlinks  = $(git config --global --get core.symlinks)"
+
+      - name: Check build tools
+        id: tools
+        shell: powershell
+        run: |
+          $missing = @()
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          $msvcOk = $false
+          if (Test-Path $vswhere) {
+            $vsPath = & $vswhere -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null
+            if ($vsPath) {
+              $vsVersion = & $vswhere -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationVersion 2>$null
+              Write-Output "MSVC   : $vsPath ($vsVersion)"
+              $msvcOk = $true
+            }
+          }
+          if (-not $msvcOk) { Write-Output "MSVC   : NOT FOUND (Visual Studio 2022 Build Tools 17.13+ required)"; $missing += "msvc" }
+          foreach ($tool in @("cmake", "ninja", "gfortran", "patch", "bash")) {
+            $command = Get-Command $tool -ErrorAction SilentlyContinue
+            if ($command) {
+              Write-Output "$($tool.PadRight(8, ' ')): $($command.Source)"
+            } else {
+              Write-Output "$($tool.PadRight(8, ' ')): NOT FOUND"
+              $missing += $tool
+            }
+          }
+          "missing=$($missing -join ',')" >> $env:GITHUB_OUTPUT
+
+      - name: Install missing build tools
+        if: ${{ steps.tools.outputs.missing != '' }}
+        shell: powershell
+        timeout-minutes: 75
+        env:
+          MISSING: ${{ steps.tools.outputs.missing }}
+          INSTALL_MEDIA_SYSDEPS: ${{ inputs.enable_media_libs }}
+        run: |
+          $common = @("--silent", "--disable-interactivity", "--accept-package-agreements", "--accept-source-agreements")
+          if ($env:MISSING -match "msvc") {
+            Write-Output "Installing Visual Studio 2022 Build Tools (MSVC 19.43+ / VS 17.13+ is required)..."
+            winget install --id Microsoft.VisualStudio.2022.BuildTools @common --override "--add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 --add Microsoft.VisualStudio.Component.VC.CMake.Project --add Microsoft.VisualStudio.Component.VC.ATL --add Microsoft.VisualStudio.Component.Windows11SDK.26100"
+            if ($LASTEXITCODE -ne 0) { throw "winget failed to install MSVC Build Tools. Install 'Visual Studio 2022 Build Tools' (17.13+) with the VC tools, CMake and ATL components manually, then re-run." }
+          }
+          if ($env:MISSING -match "cmake") {
+            winget install --id Kitware.CMake @common
+            if ($LASTEXITCODE -ne 0) { throw "winget failed to install CMake. Install CMake manually, then re-run." }
+          }
+          if ($env:MISSING -match "ninja") {
+            winget install --id Ninja-build.Ninja @common
+            if ($LASTEXITCODE -ne 0) { throw "winget failed to install Ninja. Install Ninja manually, then re-run." }
+          }
+          if ($env:MISSING -match "gfortran" -or $env:MISSING -match "patch") {
+            # Strawberry Perl provides gfortran, nasm and patch on Windows.
+            winget install --id StrawberryPerl.StrawberryPerl @common
+            if ($LASTEXITCODE -ne 0) { throw "winget failed to install Strawberry Perl (gfortran/patch). Install it manually, then re-run." }
+          }
+          if ($env:MISSING -match "bash") {
+            # bash comes from Git for Windows, which the runner itself needs.
+            # Git is often installed with only Git\cmd on PATH, so check the
+            # well-known bin locations first and add them explicitly.
+            $bashCandidates = @(
+              "C:\Program Files\Git\bin",
+              "C:\Program Files (x86)\Git\bin",
+              "C:\Program Files\Git\usr\bin",
+              "C:\Program Files (x86)\Git\usr\bin"
+            )
+            $added = $false
+            foreach ($candidate in $bashCandidates) {
+              if ((Test-Path (Join-Path $candidate "bash.exe")) -and (($env:PATH -split ';') -notcontains $candidate)) {
+                Write-Output "Adding to PATH: $candidate"
+                $candidate >> $env:GITHUB_PATH
+                $added = $true
+              }
+            }
+            if (-not $added) {
+              $git = Get-Command git -ErrorAction SilentlyContinue
+              if (-not $git) {
+                winget install --id Git.Git @common --custom "/o:PathOption=CmdTools"
+                if ($LASTEXITCODE -ne 0) { throw "winget failed to install Git for Windows (provides bash). The self-hosted runner also requires Git; install it manually, then re-run." }
+              } else {
+                Write-Warning "bash.exe was not found in the well-known Git locations (git found at $($git.Source)). Make sure bash is available to the runner, e.g. add Git's bin directory to PATH."
+              }
+            }
+          }
+          if ($env:INSTALL_MEDIA_SYSDEPS -eq "true") {
+            # winflexbison3 provides flex/bison for the amd-mesa (VA-API) sysdep build.
+            winget install --id winflexbison3.winflexbison3 @common
+            if ($LASTEXITCODE -ne 0) { Write-Warning "Could not install winflexbison3 via winget. Install it manually (choco install winflexbison3) when media libraries are enabled." }
+          }
+          # Tools installed mid-job may not be on the runner service's PATH yet;
+          # add the well-known install locations explicitly for later steps.
+          $pathCandidates = @(
+            "C:\Program Files\CMake\bin",
+            "C:\Strawberry\c\bin",
+            "C:\Strawberry\perl\bin",
+            "C:\Strawberry\perl\site\bin"
+          )
+          foreach ($candidate in $pathCandidates) {
+            if (Test-Path $candidate) { Write-Output "Adding to PATH: $candidate"; $candidate >> $env:GITHUB_PATH }
+          }
+          Write-Output "Tool installation finished. If the next steps still cannot find the tools, restart the runner service so it picks up the new machine PATH."
+
+      - name: Re-check build tools after installation
+        shell: powershell
+        run: |
+          $stillMissing = @()
+          foreach ($tool in @("cmake", "ninja", "gfortran", "patch", "bash")) {
+            if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) { $stillMissing += $tool }
+          }
+          if ($stillMissing.Count -gt 0) {
+            throw ("Tools still not on PATH after installation: " + ($stillMissing -join ', ') + ". " +
+                   "Restart the self-hosted runner service (so it picks up the updated machine PATH) and re-run this workflow.")
+          }
+          Write-Output "All required command line tools are on PATH."
+
+  # --------------------------------------------------------------------------
+  # Build: full source build for the selected GPU family (compile-only).
+  # --------------------------------------------------------------------------
+  build:
+    name: Build ROCm (${{ inputs.amdgpu_family }})
+    needs: [validate-config, preflight]
+    if: ${{ needs.validate-config.outputs.valid == 'true' }}
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 360
+    outputs:
+      rocm_package_version: ${{ steps.version.outputs.rocm_package_version }}
+      dist_dir: ${{ steps.package.outputs.dist_dir }}
+      dist_tarball: ${{ steps.package.outputs.dist_tarball }}
+      gpu_present: ${{ needs.preflight.outputs.gpu_present }}
+    env:
+      AMDGPU_FAMILY: ${{ inputs.amdgpu_family }}
+      BUILD_DIR: ${{ inputs.build_dir }}
+      RELEASE_TYPE: ${{ inputs.release_type }}
+      ENABLE_MEDIA_LIBS: ${{ inputs.enable_media_libs && 'ON' || 'OFF' }}
+      ENABLE_ML_LIBS: ${{ inputs.enable_ml_libs && 'ON' || 'OFF' }}
+      USE_CCACHE: ${{ inputs.use_ccache }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 15
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref }}
+
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Create virtual environment and install Python requirements
+        shell: bash
+        run: |
+          python -m venv .venv
+          # shellcheck disable=SC1091
+          source .venv/Scripts/activate
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -c "import yaml, CppHeaderParser, boto3; print('python requirements OK')"
+
+      - name: Configure git
+        shell: bash
+        run: |
+          git config --global core.longpaths true
+          git config --global core.symlinks true
+          git config --global fetch.parallel 10
+
+      - name: Authenticate git against GitHub (avoids API rate limits)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if command -v gh >/dev/null 2>&1; then
+            gh auth setup-git --hostname github.com
+          else
+            echo "::notice::gh CLI not found; fetching public submodules unauthenticated (may hit rate limits)."
+          fi
+
+      - name: Compute ROCm package version
+        id: version
+        shell: bash
+        env:
+          CHECKOUT_COMMIT: ${{ github.sha }}
+        run: |
+          source .venv/Scripts/activate
+          # Writes rocm_package_version (and deb/rpm variants) to $GITHUB_OUTPUT.
+          python ./build_tools/compute_rocm_package_version.py \
+            --release-type="${RELEASE_TYPE}" \
+            --override-git-sha="${CHECKOUT_COMMIT}"
+          echo "version: $(grep '^rocm_package_version=' "$GITHUB_OUTPUT" | cut -d= -f2)"
+
+      - name: Setup compiler cache (ccache)
+        id: ccache
+        if: ${{ env.USE_CCACHE == 'true' }}
+        shell: bash
+        run: |
+          if command -v ccache >/dev/null 2>&1; then
+            export CCACHE_DIR="${BUILD_DIR}/ccache"
+            mkdir -p "${CCACHE_DIR}"
+            echo "CCACHE_DIR=${CCACHE_DIR}" >> "$GITHUB_ENV"
+            ccache --set-config=max_size=50G || true
+            ccache --show-config | head -n 5 || true
+            echo "launchers=-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_HIP_COMPILER_LAUNCHER=ccache" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::ccache not found on PATH; building without a compiler cache (re-runs will be slower)."
+            echo "launchers=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fetch sources (submodules + DVC payloads)
+        timeout-minutes: 90
+        shell: bash
+        run: |
+          source .venv/Scripts/activate
+          python ./build_tools/fetch_sources.py --jobs "$(nproc)"
+
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: x64
+
+      - name: Configure
+        timeout-minutes: 30
+        shell: bash
+        env:
+          ROCM_PACKAGE_VERSION: ${{ steps.version.outputs.rocm_package_version }}
+          CCACHE_LAUNCHERS: ${{ steps.ccache.outputs.launchers }}
+        run: |
+          source .venv/Scripts/activate
+          # Pre-existing ROCm/HIP SDK installs on the build machine export
+          # HIP_PATH/ROCM_PATH and can hijack find_package(hip) (ROCm/TheRock#651).
+          # The build must use its own toolchain, so drop those variables here.
+          unset HIP_PATH ROCM_PATH HIP_CLANG_PATH
+          cmake -B "${BUILD_DIR}" -S . -GNinja \
+            --preset=windows-release \
+            -DTHEROCK_AMDGPU_FAMILIES="${AMDGPU_FAMILY}" \
+            -DTHEROCK_PACKAGE_VERSION="${ROCM_PACKAGE_VERSION}" \
+            -DTHEROCK_ENABLE_MEDIA_LIBS="${ENABLE_MEDIA_LIBS}" \
+            -DTHEROCK_ENABLE_ML_LIBS="${ENABLE_ML_LIBS}" \
+            ${CCACHE_LAUNCHERS}
+
+      - name: Build (therock-artifacts + therock-dist)
+        timeout-minutes: 350
+        shell: bash
+        run: |
+          source .venv/Scripts/activate
+          unset HIP_PATH ROCM_PATH HIP_CLANG_PATH
+          # -k 0 keeps going after errors so that partial results still get
+          # packaged; ninja still exits non-zero if anything failed.
+          cmake --build "${BUILD_DIR}" --target therock-artifacts therock-dist -- -k 0
+
+      - name: Verify build outputs
+        id: verify
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -u
+          DIST="${BUILD_DIR}/dist/rocm"
+          fail=0
+          need() {
+            if [ -e "$1" ]; then
+              echo "OK      : $1"
+            else
+              echo "MISSING : $1"
+              fail=1
+            fi
+          }
+          echo "== Verifying dist tree at ${DIST} =="
+          need "${DIST}/bin/hipInfo.exe"
+          if ls "${DIST}"/bin/amdhip64*.dll >/dev/null 2>&1; then
+            echo "OK      : $(ls "${DIST}"/bin/amdhip64*.dll)"
+          else
+            echo "MISSING : ${DIST}/bin/amdhip64*.dll (HIP runtime; clr needs the amdgpu-windows-interop payload)"
+            fail=1
+          fi
+          if ls "${DIST}"/bin/amdclang++* >/dev/null 2>&1 || ls "${DIST}"/bin/hipcc* >/dev/null 2>&1; then
+            echo "OK      : HIP compiler (amdclang++/hipcc)"
+          else
+            echo "MISSING : HIP compiler (amdclang++/hipcc)"
+            fail=1
+          fi
+          need "${DIST}/include/hip/hip_runtime.h"
+          need "${DIST}/lib/cmake/hip"
+          # Device code: either .kpack files or inlined code objects under lib/.
+          family_gfx="$(echo "${AMDGPU_FAMILY}" | grep -o 'gfx[0-9A-Za-z]*' | head -n 1)"
+          if ls "${DIST}"/.kpack/*"${family_gfx}"* >/dev/null 2>&1; then
+            echo "OK      : kpack files for ${family_gfx}: $(ls "${DIST}"/.kpack/ | head -n 10 | tr '\n' ' ')"
+          elif find "${DIST}/lib" \( -name "*${family_gfx}*" -o -name "*.co" \) 2>/dev/null | head -n 1 | grep -q .; then
+            echo "OK      : device code objects for ${family_gfx} found under lib/ (kpack split disabled)"
+          else
+            echo "WARN    : no kpack or device code files found for ${family_gfx}"
+          fi
+          echo "== bin/ (first 40 entries) =="
+          ls "${DIST}/bin" | head -n 40
+          echo "== dist size =="
+          du -sh "${DIST}" 2>/dev/null || true
+          if [ "${fail}" -ne 0 ]; then
+            echo "::error::Build finished but the dist tree is missing critical files (see above)."
+          fi
+          exit "${fail}"
+
+      - name: Package dist tarball and build info
+        id: package
+        timeout-minutes: 20
+        shell: bash
+        env:
+          ROCM_PACKAGE_VERSION: ${{ steps.version.outputs.rocm_package_version }}
+          EXCLUDED_PROJECTS: ${{ needs.validate-config.outputs.excluded_projects }}
+          RESOLVED_TARGETS: ${{ needs.validate-config.outputs.resolved_targets }}
+          GPU_PRESENT: ${{ needs.preflight.outputs.gpu_present }}
+          GPU_NAME: ${{ needs.preflight.outputs.gpu_name }}
+        run: |
+          set -u
+          DIST="${BUILD_DIR}/dist/rocm"
+          NAME="therock-dist-windows-${AMDGPU_FAMILY}-${ROCM_PACKAGE_VERSION}.tar.gz"
+          OUT="${BUILD_DIR}/${NAME}"
+          echo "Packaging ${OUT} ..."
+          # Same layout convention as the published tarballs (RELEASES.md):
+          # the archive root contains bin/, lib/, include/, share/, .kpack/, ...
+          tar -czf "${OUT}" -C "${DIST}" .
+          ls -lh "${OUT}"
+
+          {
+            echo "TheRock Windows build"
+            echo "====================="
+            echo "workflow        : $GITHUB_WORKFLOW"
+            echo "run             : $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "triggered by    : $GITHUB_ACTOR"
+            echo "built at (UTC)  : $(date -u '+%Y-%m-%d %H:%M:%S')"
+            echo "repository ref  : $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/tree/$GITHUB_SHA"
+            echo "rocm version    : ${ROCM_PACKAGE_VERSION} (release type: ${RELEASE_TYPE})"
+            echo "amdgpu family   : ${AMDGPU_FAMILY} (targets: ${RESOLVED_TARGETS})"
+            echo "excluded comps  : ${EXCLUDED_PROJECTS:-none}"
+            echo "platform        : Windows x64"
+            echo "runner GPU      : ${GPU_PRESENT} (${GPU_NAME:-no AMD GPU detected})"
+            echo "dist directory  : ${DIST}"
+            echo "dist tarball    : ${OUT}"
+            echo ""
+            echo "Install: extract the tarball to a directory of your choice (that directory"
+            echo "becomes ROCM_HOME), add its bin/ to PATH, then run bin/hipInfo.exe."
+            echo "See docs/development/github_actions_windows_build.md for details and"
+            echo "for the current support status of this GPU family on Windows."
+          } > "${BUILD_DIR}/BUILD_INFO.txt"
+          cat "${BUILD_DIR}/BUILD_INFO.txt"
+
+          echo "dist_dir=${DIST}" >> "$GITHUB_OUTPUT"
+          echo "dist_tarball=${OUT}" >> "$GITHUB_OUTPUT"
+          echo "dist_tarball_name=${NAME}" >> "$GITHUB_OUTPUT"
+          echo "build_info=${BUILD_DIR}/BUILD_INFO.txt" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build info
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: build-info-${{ inputs.amdgpu_family }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ inputs.build_dir }}/BUILD_INFO.txt
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Upload dist tarball (optional, size-limited)
+        if: ${{ inputs.upload_artifacts && success() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: therock-dist-windows-${{ inputs.amdgpu_family }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.package.outputs.dist_tarball }}
+          retention-days: 14
+          compression-level: 0
+          if-no-files-found: error
+
+      - name: Collect diagnostics
+        if: ${{ failure() }}
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -u
+          # Collect outside of the build tree so `find` cannot pick up its own copies.
+          DIAG="${RUNNER_TEMP}/diagnostics"
+          mkdir -p "${DIAG}"
+          cp "${BUILD_DIR}/CMakeCache.txt" "${DIAG}/" 2>/dev/null || true
+          cp "${BUILD_DIR}/.ninja_log" "${DIAG}/" 2>/dev/null || true
+          cp "${BUILD_DIR}/build.ninja" "${DIAG}/" 2>/dev/null || true
+          find "${BUILD_DIR}" -maxdepth 4 \( -name "CMakeError.log" -o -name "CMakeOutput.log" \) -exec cp {} "${DIAG}/" \; 2>/dev/null || true
+          tar -czf "${RUNNER_TEMP}/build-diagnostics.tar.gz" -C "${RUNNER_TEMP}" diagnostics
+          ls -lh "${RUNNER_TEMP}/build-diagnostics.tar.gz"
+
+      - name: Upload diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: build-diagnostics-${{ inputs.amdgpu_family }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/build-diagnostics.tar.gz
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Write job summary
+        if: ${{ always() }}
+        shell: bash
+        env:
+          ROCM_PACKAGE_VERSION: ${{ steps.version.outputs.rocm_package_version }}
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          {
+            echo "## Build ROCm (Windows, ${AMDGPU_FAMILY})"
+            echo ""
+            echo "| Item | Value |"
+            echo "| --- | --- |"
+            echo "| ROCm version | ${ROCM_PACKAGE_VERSION:-unknown} |"
+            echo "| AMDGPU family | ${AMDGPU_FAMILY} |"
+            echo "| Build result | ${JOB_STATUS} (compile-only; see the 'GPU runtime verification' job for actual GPU testing) |"
+            echo "| Dist directory | \`${BUILD_DIR}/dist/rocm\` (on the build machine) |"
+            echo "| Dist tarball | \`${BUILD_DIR}/therock-dist-windows-${AMDGPU_FAMILY}-${ROCM_PACKAGE_VERSION:-unknown}.tar.gz\` |"
+            echo "| ccache stats | see the full job log |"
+            echo ""
+            if command -v ccache >/dev/null 2>&1; then
+              echo '```'
+              ccache -s 2>/dev/null || true
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # --------------------------------------------------------------------------
+  # GPU runtime verification: runs ONLY on runners that have an AMD GPU.
+  # This is the only job that proves the built ROCm actually runs on hardware.
+  # --------------------------------------------------------------------------
+  gpu-validate:
+    name: GPU runtime verification
+    needs: [validate-config, build, preflight]
+    if: ${{ inputs.run_gpu_validation && needs.preflight.outputs.gpu_present == 'true' && needs.build.result == 'success' }}
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 30
+    env:
+      DIST_DIR: ${{ needs.build.outputs.dist_dir }}
+      AMDGPU_FAMILY: ${{ inputs.amdgpu_family }}
+      OFFLOAD_ARCH: ${{ needs.validate-config.outputs.offload_arch }}
+      GPU_NAME: ${{ needs.preflight.outputs.gpu_name }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check that the built dist is reachable
+        shell: bash
+        env:
+          DIST_DIR: ${{ needs.build.outputs.dist_dir }}
+        run: |
+          if [ ! -d "${DIST_DIR}" ]; then
+            echo "::error::Built dist not found at ${DIST_DIR}."
+            echo "If the self-hosted runner runs with --ephemeral, the machine (and its files) do not persist between jobs."
+            echo "Use a persistent runner, or disable run_gpu_validation and verify manually from the build machine."
+            exit 1
+          fi
+          echo "Using dist at ${DIST_DIR}"
+
+      - name: Run hipInfo from the built distribution
+        id: hipinfo
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -u
+          echo "Runner GPU: ${GPU_NAME}"
+          # Run the built binary with the built dist/bin first on PATH so the
+          # runtime DLLs built by this workflow are used.
+          export PATH="${DIST_DIR}/bin:${PATH}"
+          unset HIP_PATH ROCM_PATH HIP_CLANG_PATH
+          "${DIST_DIR}/bin/hipInfo.exe" > "${RUNNER_TEMP}/hipinfo.txt" 2>&1
+          rc=$?
+          cat "${RUNNER_TEMP}/hipinfo.txt" || true
+          if [ "${rc}" -ne 0 ]; then
+            echo "::error::hipInfo.exe exited with code ${rc}: the built HIP runtime could not initialize on this machine's GPU. The BUILD itself succeeded; this is a runtime/GPU support issue (see SUPPORTED_GPUS.md for the support status of ${AMDGPU_FAMILY} on Windows)."
+            exit 1
+          fi
+          if grep -q "${OFFLOAD_ARCH}" "${RUNNER_TEMP}/hipinfo.txt"; then
+            echo "hipInfo reports architecture ${OFFLOAD_ARCH}"
+          else
+            echo "::error::hipInfo ran but did not report ${OFFLOAD_ARCH}; see output above."
+            exit 1
+          fi
+
+      - name: Compile and run a HIP smoke test
+        id: vecadd
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          set -eu
+          set -o pipefail
+          WORK="${RUNNER_TEMP}/vecadd"
+          mkdir -p "${WORK}"
+          cat > "${WORK}/vecadd.cpp" <<'EOF'
+          // Minimal HIP smoke test: enumerate the device and run a kernel.
+          #include <hip/hip_runtime.h>
+          #include <cstdio>
+
+          __global__ void vecadd(const int* a, const int* b, int* c, int n) {
+            int i = blockIdx.x * blockDim.x + threadIdx.x;
+            if (i < n) {
+              c[i] = a[i] + b[i];
+            }
+          }
+
+          int main() {
+            int count = 0;
+            if (hipGetDeviceCount(&count) != hipSuccess || count < 1) {
+              std::printf("FAIL: no HIP device detected\n");
+              return 1;
+            }
+            hipDeviceProp_t props;
+            hipGetDeviceProperties(&props, 0);
+            std::printf("device#0: %s (gcnArch=%s, CUs=%d)\n", props.name, props.gcnArchName,
+                        props.multiProcessorCount);
+            const int n = 4096;
+            int* ha = new int[n];
+            int* hb = new int[n];
+            for (int i = 0; i < n; ++i) {
+              ha[i] = i;
+              hb[i] = 2 * i;
+            }
+            int *da = nullptr, *db = nullptr, *dc = nullptr;
+            hipMalloc(&da, n * sizeof(int));
+            hipMalloc(&db, n * sizeof(int));
+            hipMalloc(&dc, n * sizeof(int));
+            hipMemcpy(da, ha, n * sizeof(int), hipMemcpyHostToDevice);
+            hipMemcpy(db, hb, n * sizeof(int), hipMemcpyHostToDevice);
+            vecadd<<<(n + 255) / 256, 256>>>(da, db, dc, n);
+            int* hc = new int[n];
+            hipMemcpy(hc, dc, n * sizeof(int), hipMemcpyDeviceToHost);
+            for (int i = 0; i < n; ++i) {
+              if (hc[i] != 3 * i) {
+                std::printf("FAIL: mismatch at %d (%d != %d)\n", i, hc[i], 3 * i);
+                return 1;
+              }
+            }
+            std::printf("PASSED\n");
+            return 0;
+          }
+          EOF
+
+          DIST_BIN="${DIST_DIR}/bin"
+          export PATH="${DIST_BIN}:${PATH}"
+          # Make sure the BUILT toolchain/runtime is used, not a pre-existing
+          # ROCm install on the machine (e.g. HIP_PATH=C:\Program Files\AMD\ROCm\6.2).
+          unset HIP_PATH ROCM_PATH HIP_CLANG_PATH
+
+          # Prefer amdclang++ directly (see docs/development/hipcc_migration.md),
+          # fall back to hipcc if amdclang++ is unavailable for some reason.
+          EXTRA=""
+          if [ -d "${DIST_DIR}/lib/llvm/amdgcn/bitcode" ]; then
+            EXTRA="--hip-device-lib-path=${DIST_DIR}/lib/llvm/amdgcn/bitcode"
+          fi
+          if ls "${DIST_BIN}"/amdclang++* >/dev/null 2>&1; then
+            echo "Compiling with amdclang++ ..."
+            # shellcheck disable=SC2086
+            "${DIST_BIN}/amdclang++.exe" -x hip "${WORK}/vecadd.cpp" -o "${WORK}/vecadd.exe" \
+              --offload-arch="${OFFLOAD_ARCH}" --hip-path="${DIST_DIR}" ${EXTRA} \
+              -L"${DIST_DIR}/lib" -O2 2>&1 | tee "${WORK}/compile.log"
+          elif ls "${DIST_BIN}"/hipcc* >/dev/null 2>&1; then
+            echo "Compiling with hipcc ..."
+            "${DIST_BIN}/hipcc" "${WORK}/vecadd.cpp" -o "${WORK}/vecadd.exe" \
+              --offload-arch="${OFFLOAD_ARCH}" 2>&1 | tee "${WORK}/compile.log"
+          else
+            echo "::error::No HIP compiler (amdclang++/hipcc) found in ${DIST_BIN}."
+            exit 1
+          fi
+
+          # Run from inside the dist bin directory so that the DLLs built by
+          # this workflow take precedence over any other HIP runtime on the
+          # machine (e.g. a driver-installed amdhip64.dll in System32).
+          cleanup() { rm -f "${DIST_BIN}/vecadd.exe"; }
+          trap cleanup EXIT
+          cp "${WORK}/vecadd.exe" "${DIST_BIN}/vecadd.exe"
+          (cd "${DIST_BIN}" && ./vecadd.exe) 2>&1 | tee "${WORK}/run.log"
+
+      - name: List device/kpack files
+        if: ${{ always() }}
+        shell: bash
+        env:
+          DIST_DIR: ${{ needs.build.outputs.dist_dir }}
+        run: |
+          echo "== .kpack =="
+          ls -lh "${DIST_DIR}/.kpack/" 2>/dev/null || echo "(no .kpack directory; device code may be inlined under lib/)"
+          echo "== HIP runtime DLLs in dist =="
+          ls -lh "${DIST_DIR}/bin/" | grep -i "amdhip\|comgr" || true
+
+      - name: Write job summary
+        if: ${{ always() }}
+        shell: bash
+        env:
+          HIPINFO_STATUS: ${{ steps.hipinfo.outcome }}
+          VECADD_STATUS: ${{ steps.vecadd.outcome }}
+        run: |
+          {
+            echo "## GPU runtime verification (${AMDGPU_FAMILY} on ${GPU_NAME})"
+            echo ""
+            echo "This job ran the BUILT distribution on the runner's AMD GPU. It is the"
+            echo "only real GPU verification in this workflow; the build job is compile-only."
+            echo ""
+            echo "| Check | Result |"
+            echo "| --- | --- |"
+            echo "| hipInfo (device enumeration by the built runtime) | ${HIPINFO_STATUS} |"
+            echo "| HIP kernel compile + run (amdclang++/hipcc) | ${VECADD_STATUS} |"
+            echo ""
+            if [ "${HIPINFO_STATUS}" != "success" ] || [ "${VECADD_STATUS}" != "success" ]; then
+              echo "> [!WARNING]"
+              echo "> The build succeeded, but the built ROCm did NOT verify on this GPU."
+              echo "> ${AMDGPU_FAMILY} on Windows is 'Build Passing' but not 'Sanity Tested'"
+              echo "> in SUPPORTED_GPUS.md. See docs/development/github_actions_windows_build.md."
+            else
+              echo "The built ROCm was verified to run on this machine's GPU."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # --------------------------------------------------------------------------
+  # Always-on report that separates "compiled" from "verified on GPU".
+  # --------------------------------------------------------------------------
+  report:
+    name: Result summary
+    needs: [validate-config, preflight, build, gpu-validate]
+    if: ${{ always() }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+      - name: Write report
+        shell: bash
+        env:
+          FAMILY: ${{ inputs.amdgpu_family }}
+          VALID_RESULT: ${{ needs.validate-config.result }}
+          PREFLIGHT_RESULT: ${{ needs.preflight.result }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          GPU_VALIDATE_RESULT: ${{ needs.gpu-validate.result }}
+        run: |
+          {
+            echo "## ROCm Windows build report (${FAMILY})"
+            echo ""
+            echo "| Job | Result | Meaning |"
+            echo "| --- | --- | --- |"
+            echo "| Validate build target | ${VALID_RESULT} | GPU family/target exists in cmake/therock_amdgpu_targets.cmake |"
+            echo "| Preflight checks | ${PREFLIGHT_RESULT} | Disk/RAM/toolchain ready on the build machine |"
+            echo "| Build (compile-only) | ${BUILD_RESULT} | ROCm compiled successfully; says NOTHING about GPU usability |"
+            echo "| GPU runtime verification | ${GPU_VALIDATE_RESULT} | Built dist actually ran on an AMD GPU (hipInfo + HIP kernel) |"
+            echo ""
+            echo "Interpretation guide:"
+            echo ""
+            echo "- \`Build = success\` + \`GPU runtime verification = success\`: the built ROCm runs on this machine's GPU."
+            echo "- \`Build = success\` + \`GPU runtime verification = failure/skipped\`: ROCm compiled, but it was NOT verified (or verified as not working) on any GPU. Do not treat this as a working ROCm install."
+            echo "- \`Build = failure\`: see the build job log and the \`build-diagnostics-*\` artifact."
+          } >> "$GITHUB_STEP_SUMMARY"
