@@ -180,12 +180,26 @@ jobs:
         run: |
           $os = Get-CimInstance Win32_OperatingSystem
           $cs = Get-CimInstance Win32_ComputerSystem
-          $ramGb = [math]::Round($cs.TotalPhysicalMemory/1GB, 1)
-          Write-Output "OS   : $($os.Caption) ($($os.Version), $($os.OSArchitecture))"
-          Write-Output "CPU  : $($cs.Name) / $($cs.NumberOfLogicalProcessors) logical processors"
-          Write-Output "RAM  : $ramGb GB"
-          if ($os.OSArchitecture -ne "64-bit") { throw "A 64-bit Windows installation is required." }
-          if ($ramGb -lt 16) { Write-Warning "Less than 16 GB RAM detected. 16 GB+ is recommended; full builds may fail or thrash." }
+          # NOTE: Win32_OperatingSystem.OSArchitecture is LOCALIZED on some
+          # Windows builds (it returns "64 位" on a Chinese system, not
+          # "64-bit"), so it must never be compared against the English
+          # literal. [Environment]::Is64BitOperatingSystem is culture-
+          # independent and works in both Windows PowerShell and pwsh.
+          $is64BitOs = [Environment]::Is64BitOperatingSystem
+          Write-Output "OS   : $($os.Caption) ($($os.Version), arch=$($os.OSArchitecture), Is64BitOperatingSystem=$is64BitOs)"
+          if ($cs) {
+            Write-Output "CPU  : $($cs.Name) / $($cs.NumberOfLogicalProcessors) logical processors"
+            $ramGb = [math]::Round($cs.TotalPhysicalMemory/1GB, 1)
+            Write-Output "RAM  : $ramGb GB"
+            if ($ramGb -lt 16) {
+              Write-Warning "Less than 16 GB RAM detected. 16 GB+ is recommended; full builds may fail or thrash."
+            }
+          } else {
+            Write-Warning "Could not query Win32_ComputerSystem; skipping the CPU/RAM report (not fatal)."
+          }
+          if (-not $is64BitOs) {
+            throw "A 64-bit Windows installation is required ([Environment]::Is64BitOperatingSystem returned False)."
+          }
 
       - name: Check disk space
         shell: powershell
