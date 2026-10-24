@@ -88,9 +88,10 @@ Recommendations for the runner machine:
 ### 2. Toolchain
 
 The workflow's `preflight` job installs what is missing (Visual Studio 2022 Build Tools with MSVC
-19.43+/17.13+, CMake, Ninja, Strawberry Perl for gfortran/patch, Git for Windows for bash) via
-`winget`. You can also install them up front yourself - see
-[windows_support.md](windows_support.md#install-tools) for the full list. Useful one-time commands:
+19.43+/17.13+, CMake, Ninja, Strawberry Perl for gfortran/patch, Git for Windows for bash, Python
+3.12 when no runnable Python 3.11+ is on PATH) via `winget`. You can also install them up front
+yourself - see [windows_support.md](windows_support.md#install-tools) for the full list. Useful
+one-time commands:
 
 ```powershell
 winget install --id Microsoft.VisualStudio.2022.BuildTools --source winget --override "--add Microsoft.VisualStudio.Component.VC.Tools.x86.x64 --add Microsoft.VisualStudio.Component.VC.CMake.Project --add Microsoft.VisualStudio.Component.VC.ATL --add Microsoft.VisualStudio.Component.Windows11SDK.26100"
@@ -98,6 +99,15 @@ winget install cmake ninja-build.ninja strawberryperl
 git config --global core.symlinks true
 git config --global core.longpaths true
 ```
+
+**Python**: the build job uses the runner's own `python` (any 3.11+; the build tools import
+`tomllib`, which is standard library since 3.11) instead of `actions/setup-python`. That action
+downloads its version manifest from `raw.githubusercontent.com`, which is not reachable from
+every network (in mainland China the domain is DNS-poisoned, producing
+`unable to verify the first certificate` / `Failed to fetch the Python versions manifest`).
+Using the runner's Python keeps the build free of that dependency. `preflight` verifies a
+runnable Python exists and installs Python 3.12 via winget if not; note that a winget install
+mid-run needs a runner restart before the `build` job can see the new PATH.
 
 You can sanity-check the machine at any time with the repository's own validator:
 
@@ -247,19 +257,20 @@ C:\rocm-gfx900\bin\amdclang++.exe -x hip vecadd.cpp -o vecadd.exe --offload-arch
 
 ## Common failures
 
-| Symptom                                                  | Cause / fix                                                                                                                                                                                                             |
-| -------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `validate-config` fails                                  | The `amdgpu_family` input is not a known family/target; the job prints the valid list.                                                                                                                                  |
-| Preflight fails on disk                                  | `build_dir` drive has < 100 GB free (hard fail) or < 200 GB (warning). Point `build_dir` at a bigger drive; the runner workspace needs ~25 GB on its own drive.                                                         |
-| Preflight fails: "Tools still not on PATH"               | Tools were installed mid-run but the runner service has a stale PATH. Restart the runner service and re-run.                                                                                                            |
-| `No Visual Studio installation found`                    | Install VS 2022 Build Tools 17.13+ (MSVC 19.43+); older MSVC fails at link time (ROCm/TheRock#5029).                                                                                                                    |
-| `lld-link: error: duplicate symbol` in rocBLAS/rocSPARSE | Known ccache issue on Windows; re-run with `use_ccache=false`.                                                                                                                                                          |
-| `No such file or directory: (long path ...)`             | Long paths not enabled: `git config --global core.longpaths true` and re-run `fetch_sources.py`.                                                                                                                        |
-| `error: directive requires gfx90a+`                      | A selected target is not supported by some library; the family list in the failure message shows what to change.                                                                                                        |
-| Build exceeds the 6 h job limit                          | GitHub caps a job at 360 minutes. Re-run: ccache and the persistent runner resume where the build stopped. To reduce scope, set `enable_ml_libs=false` (MIOpen is the largest component) and `enable_media_libs=false`. |
-| `gpu-validate` fails with "Built dist not found"         | The runner is ephemeral (`--ephemeral`); files do not persist between jobs. Use a persistent runner or verify manually on the build machine.                                                                            |
-| `hipInfo` reports no device / crashes                    | The built runtime does not support the GPU/driver combination. For `gfx900` on Windows this is a known open question (see [Choosing the build target](#choosing-the-build-target)). The build itself succeeded.         |
-| Artifact upload fails (size)                             | Plan artifact storage limit (GitHub Free: 500 MB). Use the local `build_dir` paths instead.                                                                                                                             |
+| Symptom                                                                                   | Cause / fix                                                                                                                                                                                                                                                                                   |
+| ----------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `validate-config` fails                                                                   | The `amdgpu_family` input is not a known family/target; the job prints the valid list.                                                                                                                                                                                                        |
+| Preflight fails on disk                                                                   | `build_dir` drive has < 100 GB free (hard fail) or < 200 GB (warning). Point `build_dir` at a bigger drive; the runner workspace needs ~25 GB on its own drive.                                                                                                                               |
+| Preflight fails: "Tools still not on PATH"                                                | Tools were installed mid-run but the runner service has a stale PATH. Restart the runner service and re-run.                                                                                                                                                                                  |
+| `Failed to fetch the Python versions manifest` / `unable to verify the first certificate` | `actions/setup-python` fails when the runner cannot reach `raw.githubusercontent.com` (the domain is DNS-poisoned on some networks, e.g. mainland China). This workflow deliberately avoids that action and uses the runner's own Python 3.11+ instead, so this error should no longer occur. |
+| `No Visual Studio installation found`                                                     | Install VS 2022 Build Tools 17.13+ (MSVC 19.43+); older MSVC fails at link time (ROCm/TheRock#5029).                                                                                                                                                                                          |
+| `lld-link: error: duplicate symbol` in rocBLAS/rocSPARSE                                  | Known ccache issue on Windows; re-run with `use_ccache=false`.                                                                                                                                                                                                                                |
+| `No such file or directory: (long path ...)`                                              | Long paths not enabled: `git config --global core.longpaths true` and re-run `fetch_sources.py`.                                                                                                                                                                                              |
+| `error: directive requires gfx90a+`                                                       | A selected target is not supported by some library; the family list in the failure message shows what to change.                                                                                                                                                                              |
+| Build exceeds the 6 h job limit                                                           | GitHub caps a job at 360 minutes. Re-run: ccache and the persistent runner resume where the build stopped. To reduce scope, set `enable_ml_libs=false` (MIOpen is the largest component) and `enable_media_libs=false`.                                                                       |
+| `gpu-validate` fails with "Built dist not found"                                          | The runner is ephemeral (`--ephemeral`); files do not persist between jobs. Use a persistent runner or verify manually on the build machine.                                                                                                                                                  |
+| `hipInfo` reports no device / crashes                                                     | The built runtime does not support the GPU/driver combination. For `gfx900` on Windows this is a known open question (see [Choosing the build target](#choosing-the-build-target)). The build itself succeeded.                                                                               |
+| Artifact upload fails (size)                                                              | Plan artifact storage limit (GitHub Free: 500 MB). Use the local `build_dir` paths instead.                                                                                                                                                                                                   |
 
 ## Relationship to the upstream workflows
 
