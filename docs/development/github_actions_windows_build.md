@@ -120,6 +120,34 @@ links directory, ...) and exposes what it finds through `GITHUB_PATH`, and the `
 therefore never fatal by itself - the tool is verified by actually running it afterwards.
 Restarting the runner service after installing tools is still the cleanest long-term fix.
 
+**GitHub clone acceleration (`gh-proxy.org`)**: a build clones TheRock itself plus 12 submodules from
+`github.com` (the `amd-llvm` submodule alone is several GB), and direct clones often stall or fail
+mid-transfer from restricted networks. The `build` job therefore probes direct access *before*
+checking out - an HTTPS request against the git smart-HTTP discovery endpoint
+(`<repo>/info/refs?service=git-upload-pack`) plus a real `git ls-remote`, because a proxy that
+serves browsers does not necessarily serve git. When either probe fails - or when you set the
+`force_github_proxy` input - it rewrites all `github.com` and `raw.githubusercontent.com` URLs
+through the `https://gh-proxy.org/` mirror:
+
+```bash
+git config --global url."https://gh-proxy.org/https://github.com/".insteadOf "https://github.com/"
+git config --global url."https://gh-proxy.org/https://raw.githubusercontent.com/".insteadOf "https://raw.githubusercontent.com/"
+```
+
+The config is `--global`, so it also covers the submodule fetches in `Fetch sources`; that step
+additionally retries once through the mirror if it fails. The mirror is only a warning, never a hard
+failure - if it does not answer either, the workflow keeps the rewrite and lets the clone try
+anyway. To undo the rewrite on the machine:
+
+```bash
+git config --global --unset 'url.https://gh-proxy.org/https://github.com/.insteadOf'
+git config --global --unset 'url.https://gh-proxy.org/https://raw.githubusercontent.com/.insteadOf'
+```
+
+Note that the mirror proxies git's smart HTTP protocol, so `git clone`, `git fetch` and submodule
+updates all work through it. Private repositories would need credentials for the mirrored host, which
+the mirror cannot forward - irrelevant here, as TheRock and all submodules are public.
+
 You can sanity-check the machine at any time with the repository's own validator:
 
 ```powershell
@@ -153,18 +181,19 @@ on every push.
 1. Select **"Build ROCm (Windows, single GPU family)"**.
 1. Click **Run workflow**, choose the branch, and set the inputs:
 
-| Input                | Default                                           | Notes                                                                          |
-| -------------------- | ------------------------------------------------- | ------------------------------------------------------------------------------ |
-| `amdgpu_family`      | `gfx900`                                          | Must exist in `cmake/therock_amdgpu_targets.cmake`.                            |
-| `runner_labels`      | `["self-hosted", "Windows", "X64", "rocm-build"]` | JSON array; point at larger runners if you have them.                          |
-| `build_dir`          | `D:/therock-build`                                | Needs ~150-200 GB free.                                                        |
-| `ref`                | *(trigger ref)*                                   | Branch/tag/SHA to build.                                                       |
-| `release_type`       | `dev`                                             | Version stamping: `dev`, `nightly`, `ci`, ...                                  |
-| `enable_media_libs`  | `false`                                           | amd-mesa VA-API + rocDecode; adds time/disk and needs winflexbison3.           |
-| `enable_ml_libs`     | `true`                                            | MIOpen etc.; the largest component. Turn off to cut build time/disk.           |
-| `use_ccache`         | `true`                                            | Compiler cache; disable if you hit `lld-link: error: duplicate symbol`.        |
-| `run_gpu_validation` | `true`                                            | Runs `gpu-validate` on runners with an AMD GPU.                                |
-| `upload_artifacts`   | `false`                                           | Upload the multi-GB tarball as a workflow artifact (see storage limits below). |
+| Input                | Default                                           | Notes                                                                                                                     |
+| -------------------- | ------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `amdgpu_family`      | `gfx900`                                          | Must exist in `cmake/therock_amdgpu_targets.cmake`.                                                                       |
+| `runner_labels`      | `["self-hosted", "Windows", "X64", "rocm-build"]` | JSON array; point at larger runners if you have them.                                                                     |
+| `build_dir`          | `D:/therock-build`                                | Needs ~150-200 GB free.                                                                                                   |
+| `ref`                | *(trigger ref)*                                   | Branch/tag/SHA to build.                                                                                                  |
+| `release_type`       | `dev`                                             | Version stamping: `dev`, `nightly`, `ci`, ...                                                                             |
+| `enable_media_libs`  | `false`                                           | amd-mesa VA-API + rocDecode; adds time/disk and needs winflexbison3.                                                      |
+| `enable_ml_libs`     | `true`                                            | MIOpen etc.; the largest component. Turn off to cut build time/disk.                                                      |
+| `use_ccache`         | `true`                                            | Compiler cache; disable if you hit `lld-link: error: duplicate symbol`.                                                   |
+| `run_gpu_validation` | `true`                                            | Runs `gpu-validate` on runners with an AMD GPU.                                                                           |
+| `upload_artifacts`   | `false`                                           | Upload the multi-GB tarball as a workflow artifact (see storage limits below).                                            |
+| `force_github_proxy` | `false`                                           | Always clone GitHub repos through the `gh-proxy.org` mirror, even if direct access works (see [Toolchain](#2-toolchain)). |
 
 The workflow runs five jobs:
 
@@ -275,6 +304,8 @@ C:\rocm-gfx900\bin\amdclang++.exe -x hip vecadd.cpp -o vecadd.exe --offload-arch
 | Preflight fails: "Tools still not usable after installation"                                              | A tool is genuinely missing (or broken) after winget ran. The message lists which one; install it manually (CMake 3.25+, Ninja, Strawberry Perl for gfortran/patch, Git for Windows for bash, Python 3.11+, VS 2022 Build Tools 17.13+), then restart the runner service so it picks up the updated machine PATH.                                                                                                                                        |
 | `winget failed to install ...` / `No available upgrade found` / `No newer package versions are available` | winget exits non-zero when the package is already installed and cannot be upgraded (or a source is unreachable). This is no longer fatal: the workflow verifies the tool on disk instead, so the step only fails when the tool is really missing. If the tool *is* installed but not on the runner PATH, the workflow exposes it via `GITHUB_PATH` (see "Runner PATH vs. tools on disk" above); restarting the runner service also fixes it permanently. |
 | `Failed to fetch the Python versions manifest` / `unable to verify the first certificate`                 | `actions/setup-python` fails when the runner cannot reach `raw.githubusercontent.com` (the domain is DNS-poisoned on some networks, e.g. mainland China). This workflow deliberately avoids that action and uses the runner's own Python 3.11+ instead, so this error should no longer occur.                                                                                                                                                            |
+| Clone from `github.com` fails or stalls mid-transfer (`Checkout` / `Fetch sources`)                       | Direct GitHub access is blocked or throttled. The `Configure GitHub proxy acceleration` step probes it first and rewrites GitHub URLs through `gh-proxy.org` only when the probe fails; `Fetch sources` also retries once through the mirror. To always use the mirror, set the `force_github_proxy` input when triggering the workflow.                                                                                                                 |
+| `gh-proxy.org` unreachable / rate-limited                                                                 | The mirror is down or throttling. The workflow only warns in that case (it keeps the rewrite and lets the clone try); unset the rewrite on the machine (see "GitHub clone acceleration" above) and re-run, or retry later - once the direct probe succeeds again the mirror is not used.                                                                                                                                                                 |
 | `No Visual Studio installation found`                                                                     | Install VS 2022 Build Tools 17.13+ (MSVC 19.43+); older MSVC fails at link time (ROCm/TheRock#5029).                                                                                                                                                                                                                                                                                                                                                     |
 | `lld-link: error: duplicate symbol` in rocBLAS/rocSPARSE                                                  | Known ccache issue on Windows; re-run with `use_ccache=false`.                                                                                                                                                                                                                                                                                                                                                                                           |
 | `No such file or directory: (long path ...)`                                                              | Long paths not enabled: `git config --global core.longpaths true` and re-run `fetch_sources.py`.                                                                                                                                                                                                                                                                                                                                                         |

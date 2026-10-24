@@ -105,6 +105,10 @@ on:
         description: "Upload the dist tarball as a workflow artifact. GitHub Free only includes 500 MB artifact storage, so this fails for multi-GB tarballs; prefer the local build_dir path on a self-hosted runner."
         type: boolean
         default: false
+      force_github_proxy:
+        description: "Always clone GitHub repositories through the gh-proxy.org mirror, even if direct access to github.com appears to work. Useful when direct clones start but then stall or drop mid-transfer. By default the workflow probes github.com once and only falls back to the mirror when the probe fails."
+        type: boolean
+        default: false
 
 run-name: "Build ROCm Windows ${{ inputs.amdgpu_family }} @ ${{ github.ref_name }}"
 
@@ -742,6 +746,89 @@ jobs:
           }
           Write-Output "All build tools and bash are available for this job."
 
+      # Cloning from github.com is often slow or blocked on some networks
+      # (TheRock itself plus 12 submodules - amd-llvm alone is several GB).
+      # Probe the exact endpoint actions/checkout uses (the git smart-HTTP
+      # info/refs discovery). If the probe fails - or force_github_proxy is
+      # set - rewrite github.com and raw.githubusercontent.com URLs through
+      # the gh-proxy.org mirror using git's insteadOf. The config is written
+      # with --global, so it also covers the submodule fetches in "Fetch
+      # sources" below and every later git operation of this job.
+      - name: Configure GitHub proxy acceleration
+        shell: powershell
+        env:
+          FORCE_PROXY: ${{ inputs.force_github_proxy }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          # Keep Invoke-WebRequest's progress bar out of the job log.
+          $ProgressPreference = 'SilentlyContinue'
+          $mirror = 'https://gh-proxy.org/'
+          # GITHUB_SERVER_URL / GITHUB_REPOSITORY are default environment
+          # variables of every job. Using them keeps GitHub expression
+          # syntax out of the PowerShell source, which its parser rejects.
+          $repoUrl = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY"
+          $probeUrl = "$repoUrl/info/refs?service=git-upload-pack"
+
+          $directOk = $false
+          if ($env:FORCE_PROXY -eq 'true') {
+            Write-Output "force_github_proxy=true: skipping the direct-access probe."
+          } else {
+            # Probe 1: the git smart-HTTP discovery endpoint over HTTPS.
+            $probeError = ''
+            try {
+              $probe = Invoke-WebRequest -Uri $probeUrl -Method Get -TimeoutSec 30 -UseBasicParsing
+              $directOk = ($probe.StatusCode -eq 200)
+            } catch {
+              $directOk = $false
+              $probeError = $_.Exception.Message
+            }
+            # Probe 2: a real git operation. A proxy that serves browsers
+            # does not necessarily serve git, and git is what the clone
+            # actually uses. The low-speed limits bound a stalled connection
+            # to roughly 20 s.
+            if ($directOk -and (Get-Command git -ErrorAction SilentlyContinue)) {
+              $env:GIT_TERMINAL_PROMPT = '0'
+              $env:GIT_HTTP_LOW_SPEED_LIMIT = '1000'
+              $env:GIT_HTTP_LOW_SPEED_TIME = '20'
+              $lsOut = & git ls-remote $repoUrl HEAD 2>&1
+              if ($LASTEXITCODE -ne 0) {
+                $directOk = $false
+                $probeError = "git ls-remote exited $LASTEXITCODE"
+                $lsOut | Select-Object -First 2 | ForEach-Object { Write-Output "  git ls-remote: $_" }
+              }
+            }
+            if ($directOk) {
+              Write-Output "Direct access to $repoUrl works (HTTPS probe + git ls-remote); cloning without a proxy."
+            } else {
+              Write-Output "Direct access to $repoUrl failed: $probeError"
+            }
+          }
+
+          if (-not $directOk) {
+            git config --global url."$($mirror)https://github.com/".insteadOf "https://github.com/"
+            git config --global url."$($mirror)https://raw.githubusercontent.com/".insteadOf "https://raw.githubusercontent.com/"
+            # Confirm the mirror itself answers before relying on it. A
+            # broken mirror is only a warning, never a hard failure: direct
+            # access may still work even when the probe said otherwise, and
+            # "Fetch sources" retries through the mirror anyway.
+            $mirrorOk = $false
+            $mirrorError = ''
+            try {
+              $mprobe = Invoke-WebRequest -Uri "$mirror$probeUrl" -Method Get -TimeoutSec 60 -UseBasicParsing
+              $mirrorOk = ($mprobe.StatusCode -eq 200)
+            } catch {
+              $mirrorOk = $false
+              $mirrorError = $_.Exception.Message
+            }
+            if ($mirrorOk) {
+              Write-Output "github.com URLs are now cloned through $mirror (mirror verified, HTTP $($mprobe.StatusCode))."
+            } else {
+              Write-Warning "Configured $mirror, but the mirror did not answer ($mirrorError). Keeping the rewrite in place; direct access may still succeed."
+            }
+          }
+          Write-Output "Effective url.* git config:"
+          git config --global --get-regexp '^url\.' 2>$null | ForEach-Object { Write-Output "  $_" }
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         timeout-minutes: 15
@@ -832,7 +919,17 @@ jobs:
         shell: bash
         run: |
           source .venv/Scripts/activate
-          python ./build_tools/fetch_sources.py --jobs "$(nproc)"
+          # 12 submodules from github.com (amd-llvm alone is several GB).
+          # If the fetch fails - a clone that stalls or drops mid-transfer is
+          # the common failure mode on restricted networks - retry once with
+          # all github.com URLs rewritten through the gh-proxy.org mirror.
+          # The "Configure GitHub proxy acceleration" step may already have
+          # set this up; re-applying it is harmless.
+          if ! python ./build_tools/fetch_sources.py --jobs "$(nproc)"; then
+            echo "::warning::fetch_sources.py failed; retrying once through the gh-proxy.org mirror"
+            git config --global url."https://gh-proxy.org/https://github.com/".insteadOf "https://github.com/"
+            python ./build_tools/fetch_sources.py --jobs "$(nproc)"
+          fi
 
       - name: Set up MSVC environment
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
