@@ -754,6 +754,9 @@ jobs:
       # the gh-proxy.org mirror using git's insteadOf. The config is written
       # with --global, so it also covers the submodule fetches in "Fetch
       # sources" below and every later git operation of this job.
+      # Note: the probe only proves that SMALL requests work - a multi-GB
+      # clone can still drop mid-transfer. That case is covered by the
+      # shallow clones and the mirror retries in "Fetch sources".
       - name: Configure GitHub proxy acceleration
         shell: powershell
         env:
@@ -798,7 +801,8 @@ jobs:
               }
             }
             if ($directOk) {
-              Write-Output "Direct access to $repoUrl works (HTTPS probe + git ls-remote); cloning without a proxy."
+              Write-Output "Direct access to $repoUrl works for small requests (HTTPS probe + git ls-remote)."
+              Write-Output "Cloning directly first; large submodule clones fall back to the mirror if they drop mid-transfer."
             } else {
               Write-Output "Direct access to $repoUrl failed: $probeError"
             }
@@ -919,17 +923,36 @@ jobs:
         shell: bash
         run: |
           source .venv/Scripts/activate
-          # 12 submodules from github.com (amd-llvm alone is several GB).
-          # If the fetch fails - a clone that stalls or drops mid-transfer is
-          # the common failure mode on restricted networks - retry once with
-          # all github.com URLs rewritten through the gh-proxy.org mirror.
-          # The "Configure GitHub proxy acceleration" step may already have
-          # set this up; re-applying it is harmless.
-          if ! python ./build_tools/fetch_sources.py --jobs "$(nproc)"; then
-            echo "::warning::fetch_sources.py failed; retrying once through the gh-proxy.org mirror"
+          # --depth 1: the build only needs one source snapshot per submodule.
+          # amd-llvm (llvm-project) is multiple GB with full history, and
+          # large transfers to github.com get reset mid-download from
+          # restricted networks ("error: N bytes of body are still expected",
+          # "fetch-pack: unexpected disconnect while reading sideband packet",
+          # "fatal: early EOF", HTTP 502) - observed on the reference machine
+          # for the full clone over both the direct route and the mirror.
+          # Shrinking the transfer ~10x is what makes the clone survive.
+          fetch() {
+            python ./build_tools/fetch_sources.py --jobs "$(nproc)" --depth 1
+          }
+          # Up to 3 attempts; from the 2nd attempt on, github.com is routed
+          # through the gh-proxy.org mirror (global git config, so submodule
+          # clones follow it too). The "Configure GitHub proxy acceleration"
+          # step may have configured the mirror already - re-applying it is
+          # harmless, and a transient drop on either route is simply retried.
+          attempt=1
+          while true; do
+            if fetch; then
+              echo "fetch_sources.py succeeded on attempt $attempt"
+              break
+            fi
+            if [ "$attempt" -ge 3 ]; then
+              echo "::error::fetch_sources.py failed $attempt times in a row; see the errors above"
+              exit 1
+            fi
+            echo "::warning::fetch_sources.py failed (attempt $attempt); retrying through the gh-proxy.org mirror"
             git config --global url."https://gh-proxy.org/https://github.com/".insteadOf "https://github.com/"
-            python ./build_tools/fetch_sources.py --jobs "$(nproc)"
-          fi
+            attempt=$((attempt + 1))
+          done
 
       - name: Set up MSVC environment
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
