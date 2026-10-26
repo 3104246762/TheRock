@@ -341,3 +341,23 @@ invocation, both for the restricted-network case documented above: `fetch_source
 `--depth 1` (shallow submodule clones) and with up to 3 attempts that route through the
 `gh-proxy.org` mirror. What it deliberately does *not* use: AMD-internal runner labels, the internal
 Chocolatey mirror, the S3 artifact buckets, and Quartz reporting.
+
+## Inherited upstream automations
+
+The fork inherits all upstream workflows, including AMD-internal automations that cannot work here:
+they authenticate with GitHub App credentials (`ROCM_SYSTEMS_APP_*`, `ROCM_LIBRARIES_APP_*`,
+`GH_APP_HAULY_*`, ...) that are configured as repository secrets only in `ROCm/TheRock` - forks do
+not inherit secrets - and they push to `ROCm/*` repositories, which this fork cannot write to.
+
+- `bump_submodules.yml` ("Bump Submodule automation"): ran on 4 cron schedules per day plus a
+  `push` trigger on the submodule paths, and failed 12/12 times at the "Generate GitHub App token"
+  step. Both automatic triggers were removed; the workflow is manual-only now, and its first step
+  ("Check automation credentials") fails fast with an actionable message when the App credentials
+  are not configured. Run the real automation on `ROCm/TheRock`.
+- `compiler_bump.yml` ("Compiler Daily Bump") and `hip_tagging_automation.yml`: same class of
+  automation (daily cron / tag push, AMD-internal credentials). Still scheduled as inherited; the
+  daily bump currently fails at runner setup (`ubuntu-26.04`).
+- `unit_tests.yml`, `multi_arch_ci.yml`, `pre-commit.yml`: regular CI that runs on pushes to
+  `main` and works without special credentials. The Windows job of `unit_tests.yml` currently
+  fails with exit code 2 - a real test failure, unrelated to the automations above.
+- `security_scan_weekly.yml`: weekly schedule, passes; kept as inherited.

@@ -1,5 +1,21 @@
 # Copyright Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
+#
+# FORK NOTE (this repository is a fork of ROCm/TheRock):
+# The `schedule` and `push` triggers of this workflow were removed here. The
+# automation bumps submodules and opens PRs against ROCm/TheRock using
+# AMD-internal GitHub App credentials (ROCM_SYSTEMS_APP_ID,
+# ROCM_SYSTEMS_APP_PRIVATE_KEY, ROCM_LIBRARIES_APP_ID,
+# ROCM_LIBRARIES_APP_PRIVATE_KEY) that are configured as repository secrets
+# only in the upstream repository - forks do not inherit secrets. Every
+# automatic run in this fork therefore failed within about a minute at the
+# "Generate GitHub App token" step (12 of 12 scheduled runs failed), while
+# accomplishing nothing: the tokens are scoped to ROCm/TheRock and the
+# ROCm/* repositories, which this fork cannot write to anyway.
+# The steps belonging to the removed triggers are kept but inert, to keep this
+# file close to upstream. Run the real automation on ROCm/TheRock, or configure
+# equivalent GitHub App credentials in this fork's secrets and trigger it
+# manually (the first step then verifies the credentials before anything else).
 
 name: Bump Submodule automation
 
@@ -25,19 +41,6 @@ on:
         description: 'Pin-only replay: TheRock SHA to pin the submodule CI to'
         required: false
         default: ''
-  schedule:
-    - cron: "0 */12 * * *" # Existing cadence: rocgdb and mesa-fork. UTC: 12AM/12PM; Eastern: 8PM/8AM; Pacific: 5PM/5AM.
-    - cron: "0 7 * * *" # rocm-systems and rocm-libraries. UTC: 7AM; Eastern: 3AM; Pacific: 12AM.
-    - cron: "0 16 * * *" # rocm-systems. UTC: 4PM; Eastern: 12PM; Pacific: 9AM.
-    - cron: "0 19 * * *" # rocm-libraries. UTC: 7PM; Eastern: 3PM; Pacific: 12PM.
-  push:
-    branches:
-      - main
-    paths:
-      - rocm-systems
-      - rocm-libraries
-      - debug-tools/rocgdb/source
-      - third-party/sysdeps/common/mesa-fork
 
 permissions:
   contents: read
@@ -52,6 +55,36 @@ jobs:
       INPUT_SUBMODULE: ${{ github.event.inputs.submodule || 'all' }}
 
     steps:
+      # Fail fast, before the checkout, when the automation credentials are not
+      # configured. In this fork they never are, and without this check the
+      # failure would only surface at the "Generate GitHub App token" steps
+      # below with a cryptic action error. See the FORK NOTE at the top.
+      - name: Check automation credentials
+        env:
+          SYSTEMS_APP_ID: ${{ secrets.ROCM_SYSTEMS_APP_ID }}
+          SYSTEMS_APP_KEY: ${{ secrets.ROCM_SYSTEMS_APP_PRIVATE_KEY }}
+          LIBRARIES_APP_ID: ${{ secrets.ROCM_LIBRARIES_APP_ID }}
+          LIBRARIES_APP_KEY: ${{ secrets.ROCM_LIBRARIES_APP_PRIVATE_KEY }}
+        run: |
+          missing=()
+          if [[ -z "${SYSTEMS_APP_ID}" || -z "${SYSTEMS_APP_KEY}" ]]; then
+            missing+=("ROCM_SYSTEMS_APP_ID + ROCM_SYSTEMS_APP_PRIVATE_KEY")
+          fi
+          if [[ -z "${LIBRARIES_APP_ID}" || -z "${LIBRARIES_APP_KEY}" ]]; then
+            missing+=("ROCM_LIBRARIES_APP_ID + ROCM_LIBRARIES_APP_PRIVATE_KEY")
+          fi
+          if [[ ${#missing[@]} -gt 0 ]]; then
+            echo "::error::Missing GitHub App credentials: ${missing[*]}."
+            echo "::error::This is AMD's submodule bump automation for ROCm/TheRock. It needs"
+            echo "::error::GitHub App credentials that exist only in the upstream repository"
+            echo "::error::(forks do not inherit repository secrets), so it cannot run here."
+            echo "::error::Trigger it on ROCm/TheRock, or configure equivalent GitHub App"
+            echo "::error::credentials in this fork's secrets (Settings > Secrets and variables"
+            echo "::error::> Actions) and re-run."
+            exit 1
+          fi
+          echo "All required automation credentials are present."
+
       - name: Checkout ROCm/TheRock
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
