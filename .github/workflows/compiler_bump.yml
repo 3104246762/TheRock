@@ -1,5 +1,19 @@
 # Copyright Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
+#
+# FORK NOTE (this repository is a fork of ROCm/TheRock):
+# The `schedule` trigger of this workflow was removed here. On the upstream repo
+# this runs daily and builds/tests/publishes compiler bumps using ROCm's internal
+# AWS publication credentials (injected via `secrets: inherit` into the
+# `setup_multi_arch`, `multi_arch_build_*`, `publish_*_artifacts`, and
+# `trigger-*_wheels` jobs) and self-hosted GPU runner labels (e.g.
+# `linux-gfx950-1gpu-ccs-ossci-rocm`) that only exist in the ROCm/TheRock
+# organization. In this fork those secrets and runners are unavailable, so every
+# scheduled run failed in the downstream jobs (2 of 2 scheduled runs failed)
+# while the first `create-branch` step still succeeded. With the schedule gone
+# the workflow only runs on manual `workflow_dispatch`; the branch-creation step
+# works with GITHUB_TOKEN, but the full build/test/publish pipeline still needs
+# the upstream infrastructure.
 
 # This workflow automates the compiler team's daily branch creation and testing.
 #
@@ -21,10 +35,6 @@
 name: Compiler Daily Bump
 
 on:
-  schedule:
-    # Run daily at 1:30 AM ET (5:30 AM UTC, or 6:30 AM UTC during DST)
-    # Using 5:30 AM UTC which is 1:30 AM ET during standard time
-    - cron: "30 5 * * *"
   workflow_dispatch:
     inputs:
       branch_suffix:
