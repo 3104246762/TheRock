@@ -113,6 +113,10 @@ on:
         description: "Max parallel build jobs passed to ninja (-j). Lower this if the build hits OOM / clang frontend crashes (Exception Code 0xC0000005) under full parallelism. 0 = ninja's default (number of CPUs)."
         type: number
         default: 16
+      clean:
+        description: "Delete stale third-party build trees (BUILD_DIR/third-party/host-blas*) before building. The self-hosted runner keeps BUILD_DIR across runs, so a previously crashed build can leave corrupt .obj files that ninja will not rebuild. Enable this only if you suspect leftover artifacts; it forces a full rebuild of host-blas and is slower."
+        type: boolean
+        default: false
 
 run-name: "Build ROCm Windows ${{ inputs.amdgpu_family }} @ ${{ github.ref_name }}"
 
@@ -1000,6 +1004,14 @@ jobs:
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
         with:
           arch: x64
+
+      - name: Clean stale third-party build trees (optional)
+        if: ${{ inputs.clean }}
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          echo "::warning::clean=true: removing stale host-blas build trees under ${BUILD_DIR}/third-party/host-blas"
+          rm -rf "${BUILD_DIR}/third-party/host-blas"
 
       - name: Configure
         timeout-minutes: 30
