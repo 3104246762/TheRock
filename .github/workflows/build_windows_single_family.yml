@@ -954,6 +954,29 @@ jobs:
             attempt=$((attempt + 1))
           done
 
+      - name: Verify and repair submodule working trees
+        # fetch_sources.py populates submodules, but on a persistent
+        # self-hosted runner a submodule can be left in an
+        # "initialized-but-empty" state (stale gitlink / deinitialized
+        # working tree). git then treats it as up to date and skips it,
+        # yet the build's ExternalProject sources are missing
+        # (e.g. "base/half/CMakeLists.txt ... missing and no known rule
+        # to make it"). Force-repair any submodule whose working tree is
+        # empty so the build has every source it needs.
+        timeout-minutes: 30
+        shell: bash
+        run: |
+          git config --file .gitmodules --get-regexp 'submodule\..*\.path' | while read -r _ p; do
+            if [ -z "$(ls -A "$p" 2>/dev/null)" ]; then
+              echo "::warning::$p working tree is empty; force-updating submodule"
+              git submodule update --init --force --depth 1 -- "$p" || \
+                git submodule update --init --force -- "$p"
+            else
+              echo "OK      : $p"
+            fi
+          done
+          echo "Submodule verification complete."
+
       - name: Set up MSVC environment
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
         with:
@@ -1057,8 +1080,13 @@ jobs:
           echo "Packaging ${OUT} ..."
           # Same layout convention as the published tarballs (RELEASES.md):
           # the archive root contains bin/, lib/, include/, share/, .kpack/, ...
-          tar -czf "${OUT}" -C "${DIST}" .
-          ls -lh "${OUT}"
+          # NOTE: GNU tar on Windows treats a drive-letter path such as
+          # "D:/..." in -f as a remote host ("Cannot connect to D: resolve
+          # failed"). Change into BUILD_DIR and use a relative output name so
+          # the archive is written locally instead.
+          cd "${BUILD_DIR}"
+          tar -czf "${NAME}" -C "${DIST}" .
+          ls -lh "${NAME}"
 
           {
             echo "TheRock Windows build"
@@ -1120,8 +1148,12 @@ jobs:
           cp "${BUILD_DIR}/.ninja_log" "${DIAG}/" 2>/dev/null || true
           cp "${BUILD_DIR}/build.ninja" "${DIAG}/" 2>/dev/null || true
           find "${BUILD_DIR}" -maxdepth 4 \( -name "CMakeError.log" -o -name "CMakeOutput.log" \) -exec cp {} "${DIAG}/" \; 2>/dev/null || true
-          tar -czf "${RUNNER_TEMP}/build-diagnostics.tar.gz" -C "${RUNNER_TEMP}" diagnostics
-          ls -lh "${RUNNER_TEMP}/build-diagnostics.tar.gz"
+          # GNU tar on Windows misinterprets a drive-letter path like
+          # "D:/..." in -f as a remote host ("Cannot connect to D: resolve
+          # failed"). Change into RUNNER_TEMP and use a relative output name.
+          cd "${RUNNER_TEMP}"
+          tar -czf build-diagnostics.tar.gz diagnostics
+          ls -lh build-diagnostics.tar.gz
 
       - name: Upload diagnostics
         if: ${{ failure() }}
