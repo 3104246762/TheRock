@@ -109,6 +109,10 @@ on:
         description: "Always clone GitHub repositories through the gh-proxy.org mirror, even if direct access to github.com appears to work. Useful when direct clones start but then stall or drop mid-transfer. By default the workflow probes github.com once and only falls back to the mirror when the probe fails."
         type: boolean
         default: false
+      build_jobs:
+        description: "Max parallel build jobs passed to ninja (-j). Lower this if the build hits OOM / clang frontend crashes (Exception Code 0xC0000005) under full parallelism. 0 = ninja's default (number of CPUs)."
+        type: number
+        default: 16
 
 run-name: "Build ROCm Windows ${{ inputs.amdgpu_family }} @ ${{ github.ref_name }}"
 
@@ -1020,12 +1024,24 @@ jobs:
       - name: Build (therock-artifacts + therock-dist)
         timeout-minutes: 350
         shell: bash
+        env:
+          BUILD_JOBS: ${{ inputs.build_jobs }}
         run: |
           source .venv/Scripts/activate
           unset HIP_PATH ROCM_PATH HIP_CLANG_PATH
           # -k 0 keeps going after errors so that partial results still get
           # packaged; ninja still exits non-zero if anything failed.
-          cmake --build "${BUILD_DIR}" --target therock-artifacts therock-dist -- -k 0
+          # -j caps parallel jobs to limit memory pressure. The hip-tests
+          # clang 0xC0000005 segfault may be OOM under full parallelism; lower
+          # BUILD_JOBS (input, default 16) if it still crashes. 0 = ninja
+          # default (all CPUs) -- i.e. no -j flag is passed.
+          NINJA_JOBS="${BUILD_JOBS:-0}"
+          if [ "${NINJA_JOBS}" -gt 0 ] 2>/dev/null; then
+            JFLAG="-j ${NINJA_JOBS}"
+          else
+            JFLAG=""
+          fi
+          cmake --build "${BUILD_DIR}" --target therock-artifacts therock-dist -- -k 0 ${JFLAG}
 
       - name: Verify build outputs
         id: verify
