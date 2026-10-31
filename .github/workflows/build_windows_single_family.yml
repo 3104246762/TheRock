@@ -967,8 +967,23 @@ jobs:
         shell: bash
         run: |
           git config --file .gitmodules --get-regexp 'submodule\..*\.path' | while read -r _ p; do
-            if [ -z "$(ls -A "$p" 2>/dev/null)" ]; then
-              echo "::warning::$p working tree is empty; force-updating submodule"
+            populated=false
+            # A submodule directory can contain only its .git gitlink with no
+            # tracked files actually checked out (git then treats it as already
+            # initialized and skips it) -- that is exactly the base/half failure
+            # we hit. Exclude .git from the emptiness check so we detect a
+            # truly-empty working tree.
+            if [ -d "$p" ] && [ -n "$(ls -A "$p" 2>/dev/null | grep -v -x '.git' || true)" ]; then
+              # Confirm the checked-out commit matches the recorded gitlink.
+              # `git submodule status` prints a prefix char: space = clean,
+              # + = differs from index, - = uninitialized, U = conflict.
+              status="$(git submodule status -- "$p" 2>/dev/null | head -c1)"
+              if [ "$status" = " " ]; then
+                populated=true
+              fi
+            fi
+            if [ "$populated" = "false" ]; then
+              echo "::warning::$p working tree is not correctly checked out; force-updating submodule"
               git submodule update --init --force --depth 1 -- "$p" || \
                 git submodule update --init --force -- "$p"
             else
