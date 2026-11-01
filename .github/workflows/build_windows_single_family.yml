@@ -1054,10 +1054,13 @@ jobs:
         # manifest, so Stat() of TensileLite's deeply nested .s files fails
         # with "Filename longer than 260 characters" during the hipBLASLt
         # build. The official ninja-build Windows binary embeds the
-        # longPathAware manifest, so we fetch it (with a gh-proxy fallback)
-        # and force CMake to use it via CMAKE_MAKE_PROGRAM. If the download is
-        # unavailable, we fall back to injecting the manifest into a copy of
-        # the system ninja with mt.exe (Windows SDK), which needs no network.
+        # longPathAware manifest, so we fetch it (with gh-proxy mirrors as
+        # fallbacks) and force CMake to use it via CMAKE_MAKE_PROGRAM. If the
+        # download is unavailable, we reuse the official ninja that Visual
+        # Studio bundles with CMake (it already has the manifest). As a last
+        # resort we try to inject the manifest with mt.exe into a temp copy,
+        # but that only works on MSVC-built ninja (MinGW ninja has no resource
+        # section and cannot be patched this way).
         if: runner.os == 'Windows'
         shell: powershell
         run: |
@@ -1066,9 +1069,14 @@ jobs:
           New-Item -ItemType Directory -Force -Path $lpDir | Out-Null
           $target = Join-Path $lpDir "ninja.exe"
 
-          # Reuse an already-installed long-path-aware ninja (>= 1.11).
+          # Reuse a previously installed, VERIFIED long-path-aware ninja (>= 1.11)
+          # from a prior run. We gate on a marker file so that a half-installed or
+          # MinGW copy (e.g. Strawberry's ninja, which lacks a resource section and
+          # therefore cannot be long-path-aware) left behind by an earlier broken
+          # run is not mistaken for good and silently reused.
           $haveGood = $false
-          if (Test-Path -LiteralPath $target) {
+          $marker = Join-Path $lpDir ".lp_ok"
+          if ((Test-Path -LiteralPath $target) -and (Test-Path -LiteralPath $marker)) {
             try {
               $v = & $target --version 2>&1 | Select-Object -First 1
               if ($v -match '1\.(1[1-9]|[2-9][0-9])') { $haveGood = $true; Write-Output "long-path-aware ninja already present: $v" }
@@ -1077,16 +1085,22 @@ jobs:
 
           if (-not $haveGood) {
             # 1) Download the official ninja-build Windows binary (it embeds the
-            #    longPathAware manifest). Falls back to the gh-proxy mirror.
-            $url = "https://github.com/ninja-build/ninja/releases/download/v1.12.1/ninja-windows.zip"
-            $zip = Join-Path $env:RUNNER_TEMP "ninja-windows.zip"
+            #    longPathAware manifest). The release asset is named "ninja-win.zip"
+            # (not "ninja-windows.zip"). Tries github.com directly, then a couple
+            # of gh-proxy mirrors in case direct access is blocked.
+            $urls = @(
+              "https://github.com/ninja-build/ninja/releases/download/v1.12.1/ninja-win.zip",
+              "https://gh-proxy.org/https://github.com/ninja-build/ninja/releases/download/v1.12.1/ninja-win.zip",
+              "https://mirror.ghproxy.com/https://github.com/ninja-build/ninja/releases/download/v1.12.1/ninja-win.zip"
+            )
+            $zip = Join-Path $env:RUNNER_TEMP "ninja-win.zip"
             $downloaded = $false
-            foreach ($base in @($url, "https://gh-proxy.org/$url")) {
+            foreach ($u in $urls) {
               try {
-                Invoke-WebRequest -Uri $base -OutFile $zip -TimeoutSec 120 -UseBasicParsing
-                if (Test-Path -LiteralPath $zip) { $downloaded = $true; Write-Output "downloaded ninja from $base"; break }
+                Invoke-WebRequest -Uri $u -OutFile $zip -TimeoutSec 120 -UseBasicParsing
+                if ((Test-Path -LiteralPath $zip) -and ((Get-Item $zip).Length -gt 1000)) { $downloaded = $true; Write-Output "downloaded ninja from $u"; break }
               } catch {
-                Write-Output "download attempt failed for $base : $($_.Exception.Message)"
+                Write-Output "download attempt failed for $u : $($_.Exception.Message)"
               }
             }
             if ($downloaded) {
@@ -1098,38 +1112,64 @@ jobs:
               }
               Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
             } else {
-              # 2) Fallback: inject the longPathAware manifest into a copy of the
-              #    ninja currently on PATH (no network required).
-              Write-Output "::warning::official ninja download failed; injecting longPathAware manifest into a copy of the system ninja."
-              $sysNinja = (Get-Command ninja -ErrorAction SilentlyContinue).Source
-              if (-not $sysNinja) { throw "ninja not found on PATH and download failed" }
-              Copy-Item -LiteralPath $sysNinja -Destination $target -Force
+              # 2) No network: reuse an existing official ninja that already
+              #    embeds the longPathAware manifest. The ninja bundled with
+              #    Visual Studio's CMake is the official ninja-build binary and
+              #    carries the manifest, so prefer it over the MinGW Strawberry
+              #    ninja (which has no resource section and cannot be patched).
+              Write-Output "::warning::official ninja download failed; reusing an existing official ninja on the machine."
+              $candidates = @(
+                "D:/Microsoft Visual Studio/2022/BuildTools/Common7/IDE/CommonExtensions/Microsoft/CMake/Ninja/ninja.exe",
+                "C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/Common7/IDE/CommonExtensions/Microsoft/CMake/Ninja/ninja.exe",
+                "D:/Microsoft Visual Studio/2022/Community/Common7/IDE/CommonExtensions/Microsoft/CMake/Ninja/ninja.exe",
+                "C:/Program Files/Microsoft Visual Studio/2022/Community/Common7/IDE/CommonExtensions/Microsoft/CMake/Ninja/ninja.exe",
+                "C:/Program Files/CMake/bin/ninja.exe"
+              )
+              $src = $null
+              foreach ($c in $candidates) { if (Test-Path -LiteralPath $c) { $src = $c; break } }
+              if (-not $src) {
+                $cmd = Get-Command ninja -ErrorAction SilentlyContinue
+                if ($cmd) { $src = $cmd.Source }
+              }
+              if (-not $src) { throw "no ninja available (download failed and none found on the machine)" }
+              Copy-Item -LiteralPath $src -Destination $target -Force
+              Write-Output "copied ninja from $src (offline)"
+              # Best-effort: try to inject the longPathAware manifest into a TEMP
+              # copy. mt.exe can only write into a PE that already has a resource
+              # section (official/MSVC ninja); MinGW ninja has none, so it is left
+              # as-is and we rely on the source already being long-path-aware.
               $mt = (Get-Command mt -ErrorAction SilentlyContinue).Source
               if (-not $mt) {
                 $mt = (Get-ChildItem "C:/Program Files (x86)/Windows Kits/10/bin" -Recurse -Filter mt.exe -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
               }
-              if (-not $mt) { throw "mt.exe (Windows SDK) not found; cannot inject long-path manifest" }
-              # Write the longPathAware manifest without a here-string (YAML
-              # literal blocks preserve indentation, which would otherwise push
-              # the here-string terminator off column 0 and break PowerShell).
-              $manifest = @(
-                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-                '<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">'
-                '  <application xmlns="urn:schemas-microsoft-com:asm.v3">'
-                '    <windowsSettings>'
-                '      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>'
-                '    </windowsSettings>'
-                '  </application>'
-                '</assembly>'
-              ) -join [Environment]::NewLine
-              $mf = Join-Path $env:RUNNER_TEMP "longpath.manifest"
-              Set-Content -LiteralPath $mf -Value $manifest -Encoding UTF8
-              & $mt -manifest $mf -inputresource:"$target;#1" -outputresource:"$target;#1"
-              if ($LASTEXITCODE -ne 0) { throw "mt.exe failed to inject long-path manifest (exit $LASTEXITCODE)" }
-              Write-Output "injected longPathAware manifest into $target"
+              if ($mt) {
+                $tmp = Join-Path $env:RUNNER_TEMP "ninja_inject.exe"
+                Copy-Item -LiteralPath $target -Destination $tmp -Force
+                $manifest = @(
+                  '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                  '<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">'
+                  '  <application xmlns="urn:schemas-microsoft-com:asm.v3">'
+                  '    <windowsSettings>'
+                  '      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>'
+                  '    </windowsSettings>'
+                  '  </application>'
+                  '</assembly>'
+                ) -join [Environment]::NewLine
+                $mf = Join-Path $env:RUNNER_TEMP "longpath.manifest"
+                Set-Content -LiteralPath $mf -Value $manifest -Encoding UTF8
+                & $mt -manifest $mf -outputresource:"$tmp;#1" 2>&1
+                if ($LASTEXITCODE -eq 0) {
+                  Move-Item -LiteralPath $tmp -Destination $target -Force
+                  Write-Output "injected longPathAware manifest into $target"
+                } else {
+                  Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+                  Write-Output "::warning::mt.exe could not patch this ninja (no resource section; likely MinGW). Relying on its own behavior; if the build still fails on long paths, install an official ninja-build binary."
+                }
+              }
             }
             $v = & $target --version 2>&1 | Select-Object -First 1
             Write-Output "installed ninja: $v at $target"
+            Set-Content -LiteralPath $marker -Value $v
           }
 
           # Make it first on PATH for this and later steps, and force CMake to
