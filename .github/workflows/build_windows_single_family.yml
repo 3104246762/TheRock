@@ -630,6 +630,7 @@ jobs:
       ENABLE_MEDIA_LIBS: ${{ inputs.enable_media_libs && 'ON' || 'OFF' }}
       ENABLE_ML_LIBS: ${{ inputs.enable_ml_libs && 'ON' || 'OFF' }}
       USE_CCACHE: ${{ inputs.use_ccache }}
+      NINJA_LP_DIR: D:/tools/ninja-lp
     defaults:
       run:
         shell: bash
@@ -1014,15 +1015,17 @@ jobs:
           rm -rf "${BUILD_DIR}/third-party/host-blas"
 
       - name: Enable Windows long path support
-        # The Windows MAX_PATH limit (260 chars) makes ninja fail with
-        # "Filename longer than 260 characters" when it stats the deeply nested
-        # TensileLite .s files under rocm-libraries/.../CustomKernels/rocroller.
-        # git's `core.longpaths` (set earlier) only helps git checkout, NOT the
-        # build tools. The real fix is the OS-level LongPathsEnabled policy so
-        # that CMake's long-path-aware ninja can reach those paths. The policy is
-        # read by Windows at process start, so it only applies to the runner
-        # service AFTER it is restarted; we therefore enable it and stop early
-        # with a clear instruction instead of wasting a long build.
+        # The Windows MAX_PATH limit (260 chars) makes build tools fail on the
+        # deeply nested TensileLite .s files under rocm-libraries/.../CustomKernels/rocroller.
+        # Lifting it requires BOTH: (1) the OS LongPathsEnabled registry policy,
+        # and (2) the process declaring `longPathAware` in its executable
+        # manifest. git's `core.longpaths` (set earlier) only helps git
+        # checkout, NOT the build tools. The next step ("Install long-path-aware
+        # ninja") guarantees (2) by using a ninja binary that embeds the
+        # manifest; this step guarantees (1). The registry value is read by
+        # Windows at process start, so it only applies to the runner service
+        # AFTER it is restarted; if it was just enabled, restart the runner
+        # service before re-running.
         if: runner.os == 'Windows'
         shell: powershell
         run: |
@@ -1041,6 +1044,99 @@ jobs:
           }
           Write-Output "::error::Enabled LongPathsEnabled in the registry. Windows applies this policy only to NEW processes, so the currently running runner will still fail on long paths. Please RESTART the GitHub Actions Runner service (or reboot the machine) and re-run this workflow. Stopping now to avoid a wasted build."
 
+      - name: Install long-path-aware ninja (Windows)
+        # The Windows MAX_PATH (260-char) limit is only lifted for a process
+        # that declares `longPathAware` in its executable manifest. The OS
+        # LongPathsEnabled registry key (set in the previous step) is NOT
+        # sufficient on its own: the process must opt in via the manifest, and
+        # the registry value is only read by Windows at process start. The
+        # Strawberry Perl-bundled ninja 1.12.0 on this runner lacks that
+        # manifest, so Stat() of TensileLite's deeply nested .s files fails
+        # with "Filename longer than 260 characters" during the hipBLASLt
+        # build. The official ninja-build Windows binary embeds the
+        # longPathAware manifest, so we fetch it (with a gh-proxy fallback)
+        # and force CMake to use it via CMAKE_MAKE_PROGRAM. If the download is
+        # unavailable, we fall back to injecting the manifest into a copy of
+        # the system ninja with mt.exe (Windows SDK), which needs no network.
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $lpDir = "D:/tools/ninja-lp"
+          New-Item -ItemType Directory -Force -Path $lpDir | Out-Null
+          $target = Join-Path $lpDir "ninja.exe"
+
+          # Reuse an already-installed long-path-aware ninja (>= 1.11).
+          $haveGood = $false
+          if (Test-Path -LiteralPath $target) {
+            try {
+              $v = & $target --version 2>&1 | Select-Object -First 1
+              if ($v -match '1\.(1[1-9]|[2-9][0-9])') { $haveGood = $true; Write-Output "long-path-aware ninja already present: $v" }
+            } catch { }
+          }
+
+          if (-not $haveGood) {
+            # 1) Download the official ninja-build Windows binary (it embeds the
+            #    longPathAware manifest). Falls back to the gh-proxy mirror.
+            $url = "https://github.com/ninja-build/ninja/releases/download/v1.12.1/ninja-windows.zip"
+            $zip = Join-Path $env:RUNNER_TEMP "ninja-windows.zip"
+            $downloaded = $false
+            foreach ($base in @($url, "https://gh-proxy.org/$url")) {
+              try {
+                Invoke-WebRequest -Uri $base -OutFile $zip -TimeoutSec 120 -UseBasicParsing
+                if (Test-Path -LiteralPath $zip) { $downloaded = $true; Write-Output "downloaded ninja from $base"; break }
+              } catch {
+                Write-Output "download attempt failed for $base : $($_.Exception.Message)"
+              }
+            }
+            if ($downloaded) {
+              Expand-Archive -LiteralPath $zip -DestinationPath $lpDir -Force
+              # Some release zips nest the binary; make sure it lands at the root.
+              $exe = Get-ChildItem $lpDir -Recurse -Filter ninja.exe | Select-Object -First 1
+              if ($exe -and $exe.FullName -ne (Join-Path $lpDir 'ninja.exe')) {
+                Copy-Item -LiteralPath $exe.FullName -Destination (Join-Path $lpDir 'ninja.exe') -Force
+              }
+              Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
+            } else {
+              # 2) Fallback: inject the longPathAware manifest into a copy of the
+              #    ninja currently on PATH (no network required).
+              Write-Output "::warning::official ninja download failed; injecting longPathAware manifest into a copy of the system ninja."
+              $sysNinja = (Get-Command ninja -ErrorAction SilentlyContinue).Source
+              if (-not $sysNinja) { throw "ninja not found on PATH and download failed" }
+              Copy-Item -LiteralPath $sysNinja -Destination $target -Force
+              $mt = (Get-Command mt -ErrorAction SilentlyContinue).Source
+              if (-not $mt) {
+                $mt = (Get-ChildItem "C:/Program Files (x86)/Windows Kits/10/bin" -Recurse -Filter mt.exe -ErrorAction SilentlyContinue | Select-Object -First 1).FullName
+              }
+              if (-not $mt) { throw "mt.exe (Windows SDK) not found; cannot inject long-path manifest" }
+              # Write the longPathAware manifest without a here-string (YAML
+              # literal blocks preserve indentation, which would otherwise push
+              # the here-string terminator off column 0 and break PowerShell).
+              $manifest = @(
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">'
+                '  <application xmlns="urn:schemas-microsoft-com:asm.v3">'
+                '    <windowsSettings>'
+                '      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>'
+                '    </windowsSettings>'
+                '  </application>'
+                '</assembly>'
+              ) -join [Environment]::NewLine
+              $mf = Join-Path $env:RUNNER_TEMP "longpath.manifest"
+              Set-Content -LiteralPath $mf -Value $manifest -Encoding UTF8
+              & $mt -manifest $mf -inputresource:"$target;#1" -outputresource:"$target;#1"
+              if ($LASTEXITCODE -ne 0) { throw "mt.exe failed to inject long-path manifest (exit $LASTEXITCODE)" }
+              Write-Output "injected longPathAware manifest into $target"
+            }
+            $v = & $target --version 2>&1 | Select-Object -First 1
+            Write-Output "installed ninja: $v at $target"
+          }
+
+          # Make it first on PATH for this and later steps, and force CMake to
+          # use it explicitly (the build dir may cache an older ninja path).
+          $env:PATH = "$lpDir;$env:PATH"
+          Write-Output "$lpDir" >> $env:GITHUB_PATH
+
       - name: Configure
         timeout-minutes: 30
         shell: bash
@@ -1055,6 +1151,7 @@ jobs:
           unset HIP_PATH ROCM_PATH HIP_CLANG_PATH
           cmake -B "${BUILD_DIR}" -S . -GNinja \
             --preset=windows-release \
+            -DCMAKE_MAKE_PROGRAM="${NINJA_LP_DIR}/ninja.exe" \
             -DTHEROCK_AMDGPU_FAMILIES="${AMDGPU_FAMILY}" \
             -DTHEROCK_PACKAGE_VERSION="${ROCM_PACKAGE_VERSION}" \
             -DTHEROCK_ENABLE_MEDIA_LIBS="${ENABLE_MEDIA_LIBS}" \
