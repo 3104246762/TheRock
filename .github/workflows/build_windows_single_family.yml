@@ -1065,6 +1065,13 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
+          # Surface any unexpected failure with detail instead of a bare exit 1
+          # (which is hard to diagnose from the runner log).
+          trap {
+            Write-Output "::error::ninja install step failed: $($_.Exception.Message)"
+            Write-Output $_.ScriptStackTrace
+            exit 1
+          }
           $lpDir = "D:/tools/ninja-lp"
           New-Item -ItemType Directory -Force -Path $lpDir | Out-Null
           $target = Join-Path $lpDir "ninja.exe"
@@ -1172,10 +1179,23 @@ jobs:
             Set-Content -LiteralPath $marker -Value $v
           }
 
-          # Make it first on PATH for this and later steps, and force CMake to
-          # use it explicitly (the build dir may cache an older ninja path).
-          $env:PATH = "$lpDir;$env:PATH"
-          Write-Output "$lpDir" >> $env:GITHUB_PATH
+          # Make this ninja first on PATH for this and later steps. We also record
+          # it in $GITHUB_PATH so subsequent steps pick it up. Use Add-Content
+          # with an explicit UTF-8 encoding: PowerShell's default `>>`/Out-File
+          # encoding is UTF-16, which the runner can misread, and a PATH hiccup
+          # must not fail the step -- Configure pins CMAKE_MAKE_PROGRAM to this
+          # ninja explicitly, and the build dir already caches that path.
+          try {
+            $env:PATH = "$lpDir;$env:PATH"
+            if ($env:GITHUB_PATH -and (Test-Path -LiteralPath $env:GITHUB_PATH)) {
+              Add-Content -LiteralPath $env:GITHUB_PATH -Value $lpDir -Encoding UTF8
+              Write-Output "prepended ninja-lp to PATH and recorded in GITHUB_PATH: $lpDir"
+            } else {
+              Write-Output "::warning::GITHUB_PATH not available; relying on in-step PATH only (Configure pins CMAKE_MAKE_PROGRAM)"
+            }
+          } catch {
+            Write-Output "::warning::could not update PATH/GITHUB_PATH (non-fatal): $($_.Exception.Message)"
+          }
 
       - name: Configure
         timeout-minutes: 30
