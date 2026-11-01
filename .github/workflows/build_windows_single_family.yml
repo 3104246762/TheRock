@@ -1013,6 +1013,34 @@ jobs:
           echo "::warning::clean=true: removing stale host-blas build trees under ${BUILD_DIR}/third-party/host-blas"
           rm -rf "${BUILD_DIR}/third-party/host-blas"
 
+      - name: Enable Windows long path support
+        # The Windows MAX_PATH limit (260 chars) makes ninja fail with
+        # "Filename longer than 260 characters" when it stats the deeply nested
+        # TensileLite .s files under rocm-libraries/.../CustomKernels/rocroller.
+        # git's `core.longpaths` (set earlier) only helps git checkout, NOT the
+        # build tools. The real fix is the OS-level LongPathsEnabled policy so
+        # that CMake's long-path-aware ninja can reach those paths. The policy is
+        # read by Windows at process start, so it only applies to the runner
+        # service AFTER it is restarted; we therefore enable it and stop early
+        # with a clear instruction instead of wasting a long build.
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $key = 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem'
+          $cur = (Get-ItemProperty -Path $key -Name LongPathsEnabled -ErrorAction SilentlyContinue).LongPathsEnabled
+          if ($cur -eq 1) {
+            Write-Output 'LongPathsEnabled is already enabled; ninja can use long paths.'
+            exit 0
+          }
+          Write-Output "::warning::LongPathsEnabled is not set (current=$cur). Enabling it now (requires Administrator)..."
+          try {
+            Set-ItemProperty -Path $key -Name LongPathsEnabled -Value 1 -Type DWord -Force
+          } catch {
+            Write-Output "::error::Could not set LongPathsEnabled (runner is not Administrator). Run this once as Administrator, then restart the runner service and re-run: New-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' -Name LongPathsEnabled -Value 1 -PropertyType DWORD -Force"
+            exit 1
+          }
+          Write-Output "::error::Enabled LongPathsEnabled in the registry. Windows applies this policy only to NEW processes, so the currently running runner will still fail on long paths. Please RESTART the GitHub Actions Runner service (or reboot the machine) and re-run this workflow. Stopping now to avoid a wasted build."
+
       - name: Configure
         timeout-minutes: 30
         shell: bash
