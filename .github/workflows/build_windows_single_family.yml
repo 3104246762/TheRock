@@ -1045,22 +1045,23 @@ jobs:
           Write-Output "::error::Enabled LongPathsEnabled in the registry. Windows applies this policy only to NEW processes, so the currently running runner will still fail on long paths. Please RESTART the GitHub Actions Runner service (or reboot the machine) and re-run this workflow. Stopping now to avoid a wasted build."
 
       - name: Install long-path-aware ninja (Windows)
-        # The Windows MAX_PATH (260-char) limit is only lifted for a process
-        # that declares `longPathAware` in its executable manifest. The OS
-        # LongPathsEnabled registry key (set in the previous step) is NOT
-        # sufficient on its own: the process must opt in via the manifest, and
-        # the registry value is only read by Windows at process start. The
-        # Strawberry Perl-bundled ninja 1.12.0 on this runner lacks that
-        # manifest, so Stat() of TensileLite's deeply nested .s files fails
-        # with "Filename longer than 260 characters" during the hipBLASLt
-        # build. The official ninja-build Windows binary embeds the
-        # longPathAware manifest, so we fetch it (with gh-proxy mirrors as
-        # fallbacks) and force CMake to use it via CMAKE_MAKE_PROGRAM. If the
-        # download is unavailable, we reuse the official ninja that Visual
-        # Studio bundles with CMake (it already has the manifest). As a last
-        # resort we try to inject the manifest with mt.exe into a temp copy,
-        # but that only works on MSVC-built ninja (MinGW ninja has no resource
-        # section and cannot be patched this way).
+        # Root cause of the hipBLASLt "Filename longer than 260 characters"
+        # failure: the Windows MAX_PATH limit is enforced by ninja's own path
+        # handling, NOT by the OS. Both the official ninja 1.12.1 binary and
+        # the Strawberry-bundled 1.12.0 carry a `longPathAware` manifest and
+        # the OS LongPathsEnabled registry key is on, yet 1.12.0 (MinGW build)
+        # STILL fails Stat() on TensileLite's >260-char .s paths while 1.12.1
+        # does not -- 1.12.0 has a hard MAX_PATH buffer in its Windows code that
+        # the manifest cannot fix. We verified this locally: the same 295-char
+        # path is rejected by 1.12.0 and accepted by 1.12.1.
+        #
+        # The build keeps BUILD_DIR (D:/therock-build) across runs, so the
+        # hipBLASLt subproject's CMakeCache still caches CMAKE_MAKE_PROGRAM =
+        # C:/Strawberry/c/bin/ninja.exe (1.12.0) from an earlier run. Merely
+        # putting a good ninja first on PATH is not enough -- we must place a
+        # long-path-capable ninja (>= 1.12.1) AT that cached path. So this step
+        # both installs D:/tools/ninja-lp/ninja.exe (1.12.1) and overwrites the
+        # system ninja(s) CMake resolves with it (backing up the originals).
         if: runner.os == 'Windows'
         shell: powershell
         run: |
@@ -1072,22 +1073,36 @@ jobs:
             Write-Output $_.ScriptStackTrace
             exit 1
           }
+          # A ninja is long-path-capable only if it is >= 1.12.1. The MinGW
+          # 1.12.0 that Strawberry ships carries the longPathAware manifest but
+          # still has a hard MAX_PATH limit in its Windows code, so 1.12.0 must
+          # NOT be treated as good (an earlier version of this step did, which is
+          # why the hipBLASLt build kept failing).
+          function Test-NinjaLongPathOk($path) {
+            if (-not (Test-Path -LiteralPath $path)) { return $false }
+            try { $v = & $path --version 2>&1 | Select-Object -First 1 } catch { return $false }
+            if ($v -match '(\d+)\.(\d+)\.(\d+)') {
+              $maj = [int]$Matches[1]; $mnr = [int]$Matches[2]; $pat = [int]$Matches[3]
+              if ($maj -gt 1) { return $true }
+              if ($maj -eq 1 -and $mnr -gt 12) { return $true }
+              if ($maj -eq 1 -and $mnr -eq 12 -and $pat -ge 1) { return $true }
+              return $false
+            }
+            return $false
+          }
+
           $lpDir = "D:/tools/ninja-lp"
           New-Item -ItemType Directory -Force -Path $lpDir | Out-Null
           $target = Join-Path $lpDir "ninja.exe"
 
-          # Reuse a previously installed, VERIFIED long-path-aware ninja (>= 1.11)
-          # from a prior run. We gate on a marker file so that a half-installed or
-          # MinGW copy (e.g. Strawberry's ninja, which lacks a resource section and
-          # therefore cannot be long-path-aware) left behind by an earlier broken
-          # run is not mistaken for good and silently reused.
+          # Reuse a previously installed, VERIFIED long-path-capable ninja
+          # (>= 1.12.1) from a prior run. We gate on a marker file so that a
+          # half-installed or broken copy left behind by an earlier run is not
+          # mistaken for good and silently reused.
           $haveGood = $false
           $marker = Join-Path $lpDir ".lp_ok"
           if ((Test-Path -LiteralPath $target) -and (Test-Path -LiteralPath $marker)) {
-            try {
-              $v = & $target --version 2>&1 | Select-Object -First 1
-              if ($v -match '1\.(1[1-9]|[2-9][0-9])') { $haveGood = $true; Write-Output "long-path-aware ninja already present: $v" }
-            } catch { }
+            if (Test-NinjaLongPathOk $target) { $haveGood = $true; $v = & $target --version 2>&1 | Select-Object -First 1; Write-Output "long-path-capable ninja already present: $v" }
           }
 
           if (-not $haveGood) {
@@ -1195,6 +1210,42 @@ jobs:
             }
           } catch {
             Write-Output "::warning::could not update PATH/GITHUB_PATH (non-fatal): $($_.Exception.Message)"
+          }
+
+          # CRITICAL: the persistent build dir (BUILD_DIR, kept across runs)
+          # caches CMAKE_MAKE_PROGRAM for each subproject as an ABSOLUTE path to
+          # the ninja that was first on PATH when it was first configured. For
+          # hipBLASLt that is C:/Strawberry/c/bin/ninja.exe (the broken 1.12.0).
+          # Putting ninja-lp first on PATH does NOT change that cached path, so we
+          # overwrite the system ninja(s) CMake resolves with our long-path-capable
+          # 1.12.1 (backing up originals). This is what actually fixes the
+          # hipBLASLt "Filename longer than 260 characters" failure, because the
+          # cached path now resolves to a ninja whose Windows code handles long
+          # paths. (We never delete the originals -- a .bak is kept.)
+          if (Test-NinjaLongPathOk $target) {
+            $sysNinjas = @(
+              "C:/Strawberry/c/bin/ninja.exe",
+              "D:/Microsoft Visual Studio/2022/BuildTools/Common7/IDE/CommonExtensions/Microsoft/CMake/Ninja/ninja.exe",
+              "C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/Common7/IDE/CommonExtensions/Microsoft/CMake/Ninja/ninja.exe"
+            )
+            foreach ($sn in $sysNinjas) {
+              if (-not (Test-Path -LiteralPath $sn)) { continue }
+              if (Test-NinjaLongPathOk $sn) {
+                Write-Output "$sn already long-path-capable; left untouched"
+                continue
+              }
+              try {
+                $bak = "$sn.bak"
+                if (-not (Test-Path -LiteralPath $bak)) { Copy-Item -LiteralPath $sn -Destination $bak -Force }
+                Copy-Item -LiteralPath $target -Destination $sn -Force
+                $nv = & $sn --version 2>&1 | Select-Object -First 1
+                Write-Output "replaced $sn with long-path-capable ninja ($nv); backup at $bak"
+              } catch {
+                Write-Output "::warning::could not replace $sn (non-fatal): $($_.Exception.Message)"
+              }
+            }
+          } else {
+            Write-Output "::warning::ninja-lp itself is not long-path-capable; skipping system overwrite (build may still fail on long paths)."
           }
 
       - name: Configure
